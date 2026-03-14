@@ -12,8 +12,8 @@ import express from "express";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import { execSync } from "child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { Octokit } from "octokit";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -21,11 +21,8 @@ import { Octokit } from "octokit";
 
 const PORT = parseInt(process.env.PORT ?? "3001", 10);
 const WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET ?? "";
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN!;
 const WORKDIR = process.env.DEVIN_WORKDIR ?? path.join(process.env.HOME ?? "/tmp", "devin-workspaces");
 const SESSION_MAP_PATH = path.join(WORKDIR, ".session-map.json");
-
-const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
 // ---------------------------------------------------------------------------
 // Session Map: Issue → Claude Code session ID
@@ -51,35 +48,37 @@ function issueKey(owner: string, repo: string, issueNumber: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub Helpers
+// GitHub Helpers (via gh CLI — no Octokit dependency)
 // ---------------------------------------------------------------------------
 
 function verifySignature(payload: string, signature: string): boolean {
-  if (!WEBHOOK_SECRET) return true; // Skip verification if no secret configured
+  if (!WEBHOOK_SECRET) return true;
   const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(payload).digest("hex");
   if (signature.length !== expected.length) return false;
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
 
-async function commentOnIssue(owner: string, repo: string, issueNumber: number, body: string) {
-  await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: issueNumber,
-    body,
-  });
+function ghComment(owner: string, repo: string, issueNumber: number, body: string) {
+  try {
+    execSync(`gh issue comment ${issueNumber} --repo ${owner}/${repo} --body ${JSON.stringify(body)}`, {
+      stdio: "pipe",
+      timeout: 30000,
+    });
+  } catch (e) {
+    console.error(`[devin] Failed to comment on ${owner}/${repo}#${issueNumber}:`, e);
+  }
 }
 
-async function getIssueComments(owner: string, repo: string, issueNumber: number): Promise<string> {
-  const { data: comments } = await octokit.rest.issues.listComments({
-    owner,
-    repo,
-    issue_number: issueNumber,
-    per_page: 20,
-  });
-  return comments
-    .map(c => `@${c.user?.login}: ${c.body}`)
-    .join("\n\n---\n\n");
+function ghGetComments(owner: string, repo: string, issueNumber: number): string {
+  try {
+    const out = execSync(
+      `gh api repos/${owner}/${repo}/issues/${issueNumber}/comments --jq '.[].body' 2>/dev/null | tail -20`,
+      { stdio: "pipe", timeout: 15000 },
+    );
+    return out.toString().trim();
+  } catch {
+    return "";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,20 +103,20 @@ async function handleDevinMention(params: {
   const repoDir = path.join(WORKDIR, owner, repo);
   if (!fs.existsSync(path.join(repoDir, ".git"))) {
     fs.mkdirSync(repoDir, { recursive: true });
-    const { execSync } = await import("child_process");
     execSync(`git clone https://github.com/${owner}/${repo}.git ${repoDir}`, { stdio: "pipe" });
   } else {
-    const { execSync } = await import("child_process");
-    execSync("git fetch origin && git checkout main && git pull origin main", { cwd: repoDir, stdio: "pipe" });
+    try {
+      execSync("git fetch origin && git checkout main && git pull origin main", { cwd: repoDir, stdio: "pipe" });
+    } catch {
+      console.log(`[devin] Git pull failed for ${key}, continuing with existing state`);
+    }
   }
 
-  // Build the prompt
   const prompt = buildPrompt({ issueNumber, issueTitle, request, isPR, conversationHistory, owner, repo });
 
   console.log(`[devin] Processing: ${key} (session: ${existingSessionId ?? "new"})`);
 
-  // Notify that we're starting
-  await commentOnIssue(owner, repo, issueNumber, `收到！正在处理中...`);
+  ghComment(owner, repo, issueNumber, "收到！正在处理中...");
 
   let sessionId: string | undefined;
   let result = "";
@@ -139,7 +138,6 @@ async function handleDevinMention(params: {
     for await (const message of query(queryOptions)) {
       if (message.type === "system" && message.subtype === "init") {
         sessionId = message.session_id;
-        // Save session mapping immediately
         sessionMap[key] = sessionId;
         saveSessionMap(sessionMap);
       }
@@ -148,15 +146,14 @@ async function handleDevinMention(params: {
       }
     }
 
-    // Post the result as a comment
     if (result) {
-      await commentOnIssue(owner, repo, issueNumber, result);
+      ghComment(owner, repo, issueNumber, result);
     }
 
     console.log(`[devin] Completed: ${key}`);
   } catch (error) {
     console.error(`[devin] Error processing ${key}:`, error);
-    await commentOnIssue(
+    ghComment(
       owner,
       repo,
       issueNumber,
@@ -200,7 +197,7 @@ function buildPrompt(params: {
   owner: string;
   repo: string;
 }): string {
-  const { issueNumber, issueTitle, request, isPR, conversationHistory, owner, repo } = params;
+  const { issueNumber, issueTitle, request, isPR, conversationHistory } = params;
 
   if (isPR) {
     return `用户在 PR #${issueNumber} 上 @devin 了你。
@@ -249,23 +246,18 @@ app.post("/webhook", async (req, res) => {
   const eventType = req.headers["x-github-event"] as string;
   const event = JSON.parse(rawBody);
 
-  // Respond immediately, process async
   res.json({ ok: true });
 
-  // Only handle @devin mentions
   if (eventType === "issue_comment" && event.action === "created") {
     const body: string = event.comment?.body ?? "";
     if (!body.toLowerCase().includes("@devin")) return;
-
-    // Ignore bot comments
     if (event.comment?.user?.login?.includes("[bot]")) return;
     if (event.comment?.user?.login === "github-actions") return;
 
     const owner = event.repository.owner.login;
     const repo = event.repository.name;
     const issueNumber = event.issue.number;
-
-    const conversationHistory = await getIssueComments(owner, repo, issueNumber);
+    const conversationHistory = ghGetComments(owner, repo, issueNumber);
 
     handleDevinMention({
       owner,
