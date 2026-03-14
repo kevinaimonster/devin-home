@@ -1,9 +1,9 @@
 /**
  * Devin Agent Server
  *
- * A lightweight webhook server that receives GitHub events and dispatches
- * Claude Code sessions via the Agent SDK. Each Issue maps to a persistent
- * session that can be resumed across multiple @devin interactions.
+ * Webhook server that receives GitHub @devin mentions, uses LLM to analyze
+ * requirements, generate code, and create PRs. Each Issue maps to a conversation
+ * context for multi-turn interactions.
  *
  * Run: npx tsx src/agent/server.ts
  */
@@ -13,7 +13,7 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { execSync } from "child_process";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import OpenAI from "openai";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -22,33 +22,39 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 const PORT = parseInt(process.env.PORT ?? "3001", 10);
 const WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET ?? "";
 const WORKDIR = process.env.DEVIN_WORKDIR ?? path.join(process.env.HOME ?? "/tmp", "devin-workspaces");
-const SESSION_MAP_PATH = path.join(WORKDIR, ".session-map.json");
+const CONTEXT_DIR = path.join(WORKDIR, ".contexts");
+
+const LLM_BASE_URL = process.env.LLM_BASE_URL ?? "https://api.deepseek.com";
+const LLM_API_KEY = process.env.LLM_API_KEY!;
+const LLM_MODEL = process.env.LLM_MODEL ?? "deepseek-chat";
+
+const openai = new OpenAI({ baseURL: LLM_BASE_URL, apiKey: LLM_API_KEY });
 
 // ---------------------------------------------------------------------------
-// Session Map: Issue → Claude Code session ID
+// Context persistence: Issue → conversation history
 // ---------------------------------------------------------------------------
 
-type SessionMap = Record<string, string>; // "owner/repo#123" → sessionId
+type Message = { role: "system" | "user" | "assistant"; content: string };
 
-function loadSessionMap(): SessionMap {
+function contextPath(owner: string, repo: string, issueNumber: number): string {
+  return path.join(CONTEXT_DIR, `${owner}_${repo}_${issueNumber}.json`);
+}
+
+function loadContext(owner: string, repo: string, issueNumber: number): Message[] {
   try {
-    return JSON.parse(fs.readFileSync(SESSION_MAP_PATH, "utf-8"));
+    return JSON.parse(fs.readFileSync(contextPath(owner, repo, issueNumber), "utf-8"));
   } catch {
-    return {};
+    return [];
   }
 }
 
-function saveSessionMap(map: SessionMap) {
-  fs.mkdirSync(path.dirname(SESSION_MAP_PATH), { recursive: true });
-  fs.writeFileSync(SESSION_MAP_PATH, JSON.stringify(map, null, 2));
-}
-
-function issueKey(owner: string, repo: string, issueNumber: number): string {
-  return `${owner}/${repo}#${issueNumber}`;
+function saveContext(owner: string, repo: string, issueNumber: number, messages: Message[]) {
+  fs.mkdirSync(CONTEXT_DIR, { recursive: true });
+  fs.writeFileSync(contextPath(owner, repo, issueNumber), JSON.stringify(messages, null, 2));
 }
 
 // ---------------------------------------------------------------------------
-// GitHub Helpers (via gh CLI — no Octokit dependency)
+// GitHub Helpers (via gh CLI)
 // ---------------------------------------------------------------------------
 
 function verifySignature(payload: string, signature: string): boolean {
@@ -60,29 +66,65 @@ function verifySignature(payload: string, signature: string): boolean {
 
 function ghComment(owner: string, repo: string, issueNumber: number, body: string) {
   try {
-    execSync(`gh issue comment ${issueNumber} --repo ${owner}/${repo} --body ${JSON.stringify(body)}`, {
+    const escaped = body.replace(/'/g, "'\\''");
+    execSync(`gh issue comment ${issueNumber} --repo ${owner}/${repo} --body '${escaped}'`, {
       stdio: "pipe",
       timeout: 30000,
     });
   } catch (e) {
-    console.error(`[devin] Failed to comment on ${owner}/${repo}#${issueNumber}:`, e);
+    console.error(`[devin] Failed to comment:`, e instanceof Error ? e.message : e);
   }
 }
 
-function ghGetComments(owner: string, repo: string, issueNumber: number): string {
+function ghGetIssueBody(owner: string, repo: string, issueNumber: number): string {
   try {
-    const out = execSync(
-      `gh api repos/${owner}/${repo}/issues/${issueNumber}/comments --jq '.[].body' 2>/dev/null | tail -20`,
+    return execSync(
+      `gh issue view ${issueNumber} --repo ${owner}/${repo} --json body --jq .body`,
       { stdio: "pipe", timeout: 15000 },
-    );
-    return out.toString().trim();
+    ).toString().trim();
   } catch {
     return "";
   }
 }
 
+function ghCreateFile(owner: string, repo: string, filePath: string, content: string, branch: string, message: string) {
+  const encoded = Buffer.from(content).toString("base64");
+  // Check if file exists on branch
+  try {
+    const sha = execSync(
+      `gh api repos/${owner}/${repo}/contents/${filePath}?ref=${branch} --jq .sha 2>/dev/null`,
+      { stdio: "pipe", timeout: 10000 },
+    ).toString().trim();
+    // File exists, update it
+    execSync(
+      `gh api repos/${owner}/${repo}/contents/${filePath} --method PUT -f message="${message}" -f content="${encoded}" -f branch="${branch}" -f sha="${sha}"`,
+      { stdio: "pipe", timeout: 30000 },
+    );
+  } catch {
+    // File doesn't exist, create it
+    execSync(
+      `gh api repos/${owner}/${repo}/contents/${filePath} --method PUT -f message="${message}" -f content="${encoded}" -f branch="${branch}"`,
+      { stdio: "pipe", timeout: 30000 },
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Core: Dispatch Claude Code session
+// LLM helpers
+// ---------------------------------------------------------------------------
+
+async function chat(messages: Message[]): Promise<string> {
+  const response = await openai.chat.completions.create({
+    model: LLM_MODEL,
+    messages,
+    max_tokens: 8192,
+    temperature: 0.3,
+  });
+  return response.choices[0]?.message?.content ?? "";
+}
+
+// ---------------------------------------------------------------------------
+// Core: Handle @devin mention
 // ---------------------------------------------------------------------------
 
 async function handleDevinMention(params: {
@@ -92,139 +134,162 @@ async function handleDevinMention(params: {
   issueTitle: string;
   request: string;
   isPR: boolean;
-  conversationHistory: string;
 }) {
-  const { owner, repo, issueNumber, issueTitle, request, isPR, conversationHistory } = params;
-  const key = issueKey(owner, repo, issueNumber);
-  const sessionMap = loadSessionMap();
-  const existingSessionId = sessionMap[key];
+  const { owner, repo, issueNumber, issueTitle, request, isPR } = params;
+  const key = `${owner}/${repo}#${issueNumber}`;
 
-  // Prepare workspace: clone or pull the repo
-  const repoDir = path.join(WORKDIR, owner, repo);
-  if (!fs.existsSync(path.join(repoDir, ".git"))) {
-    fs.mkdirSync(repoDir, { recursive: true });
-    execSync(`git clone https://github.com/${owner}/${repo}.git ${repoDir}`, { stdio: "pipe" });
-  } else {
-    try {
-      execSync("git fetch origin && git checkout main && git pull origin main", { cwd: repoDir, stdio: "pipe" });
-    } catch {
-      console.log(`[devin] Git pull failed for ${key}, continuing with existing state`);
-    }
-  }
-
-  const prompt = buildPrompt({ issueNumber, issueTitle, request, isPR, conversationHistory, owner, repo });
-
-  console.log(`[devin] Processing: ${key} (session: ${existingSessionId ?? "new"})`);
-
-  ghComment(owner, repo, issueNumber, "收到！正在处理中...");
-
-  let sessionId: string | undefined;
-  let result = "";
+  console.log(`[devin] Processing: ${key}`);
+  ghComment(owner, repo, issueNumber, "🤖 收到！正在分析需求...");
 
   try {
-    const queryOptions: Parameters<typeof query>[0] = {
-      prompt,
-      options: {
-        cwd: repoDir,
-        allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent"],
-        permissionMode: "bypassPermissions" as const,
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 50,
-        systemPrompt: buildSystemPrompt(owner, repo, issueNumber),
-        ...(existingSessionId ? { resume: existingSessionId } : {}),
-      },
-    };
+    // Load conversation context for this issue
+    let messages = loadContext(owner, repo, issueNumber);
 
-    for await (const message of query(queryOptions)) {
-      if (message.type === "system" && message.subtype === "init") {
-        sessionId = message.session_id;
-        sessionMap[key] = sessionId;
-        saveSessionMap(sessionMap);
-      }
-      if ("result" in message) {
-        result = message.result;
-      }
+    // First interaction: set up system prompt and gather context
+    if (messages.length === 0) {
+      // Get repo file tree
+      let fileTree = "";
+      try {
+        fileTree = execSync(
+          `gh api repos/${owner}/${repo}/git/trees/main?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' 2>/dev/null | head -100`,
+          { stdio: "pipe", timeout: 15000 },
+        ).toString().trim();
+      } catch { /* empty repo */ }
+
+      // Get README or CLAUDE.md
+      let projectContext = "";
+      try {
+        projectContext = execSync(
+          `gh api repos/${owner}/${repo}/contents/README.md --jq .content 2>/dev/null | base64 -d`,
+          { stdio: "pipe", timeout: 10000 },
+        ).toString().trim();
+      } catch { /* no readme */ }
+
+      const issueBody = ghGetIssueBody(owner, repo, issueNumber);
+
+      messages = [{
+        role: "system",
+        content: `你是 Devin，一个 AI 软件工程师。你通过 GitHub Issue 接收需求并自动完成开发工作。
+
+当前项目：${owner}/${repo}
+Issue #${issueNumber}：${issueTitle}
+
+项目文件结构：
+${fileTree || "(空项目)"}
+
+${projectContext ? `项目说明：\n${projectContext}` : ""}
+
+你的工作方式：
+1. 分析需求。如果不清晰，输出需要澄清的问题列表，格式：{"action": "clarify", "questions": ["问题1", "问题2"]}
+2. 如果需求明确，制定方案并生成代码。输出格式：
+{
+  "action": "implement",
+  "summary": "方案摘要",
+  "files": [
+    {"path": "文件路径", "content": "完整文件内容"}
+  ],
+  "branch": "devin/issue-${issueNumber}-简短描述",
+  "pr_title": "PR 标题"
+}
+
+关键规则：
+- 只输出 JSON，不要输出其他内容
+- 文件内容必须是完整的，可以直接使用的代码
+- branch 名使用英文小写和连字符
+- 代码质量要高，界面要好看`,
+      }, {
+        role: "user",
+        content: `Issue 标题：${issueTitle}\nIssue 内容：${issueBody}\n\n用户请求：${request}`,
+      }];
+    } else {
+      // Follow-up interaction: add the new message
+      messages.push({
+        role: "user",
+        content: `用户追加说：${request}`,
+      });
     }
 
-    if (result) {
-      ghComment(owner, repo, issueNumber, result);
+    // Call LLM
+    const response = await chat(messages);
+    messages.push({ role: "assistant", content: response });
+    saveContext(owner, repo, issueNumber, messages);
+
+    // Parse response
+    const jsonMatch = response.match(/```(?:json)?\s*([\s\S]*?)```/) ?? [null, response];
+    let cleaned = (jsonMatch[1] ?? response).trim();
+    // Try to extract JSON if there's surrounding text
+    const braceMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (braceMatch) cleaned = braceMatch[0];
+
+    const result = JSON.parse(cleaned);
+
+    if (result.action === "clarify") {
+      const questions = (result.questions as string[]).map((q, i) => `${i + 1}. ${q}`).join("\n");
+      ghComment(owner, repo, issueNumber,
+        `我需要更多信息来开始工作：\n\n${questions}\n\n请回复后 @devin 我会继续。`
+      );
+      console.log(`[devin] Clarifying: ${key}`);
+      return;
+    }
+
+    if (result.action === "implement") {
+      // 1. Post plan
+      ghComment(owner, repo, issueNumber,
+        `## 📋 实施方案\n\n${result.summary}\n\n### 变更文件\n${result.files.map((f: any) => `- \`${f.path}\``).join("\n")}\n\n正在编写代码...`
+      );
+
+      // 2. Create branch
+      const branchName: string = result.branch || `devin/issue-${issueNumber}`;
+      try {
+        const mainSha = execSync(
+          `gh api repos/${owner}/${repo}/git/ref/heads/main --jq .object.sha`,
+          { stdio: "pipe", timeout: 10000 },
+        ).toString().trim();
+        execSync(
+          `gh api repos/${owner}/${repo}/git/refs --method POST -f ref="refs/heads/${branchName}" -f sha="${mainSha}"`,
+          { stdio: "pipe", timeout: 10000 },
+        );
+      } catch (e) {
+        console.log(`[devin] Branch may already exist:`, e instanceof Error ? e.message : e);
+      }
+
+      // 3. Commit files
+      for (const file of result.files) {
+        try {
+          ghCreateFile(owner, repo, file.path, file.content, branchName, `Add ${file.path}\n\nPart of #${issueNumber}`);
+          console.log(`[devin] Committed: ${file.path}`);
+        } catch (e) {
+          console.error(`[devin] Failed to commit ${file.path}:`, e instanceof Error ? e.message : e);
+        }
+      }
+
+      // 4. Create PR
+      try {
+        const prTitle = result.pr_title || `[Devin] ${issueTitle}`;
+        const prUrl = execSync(
+          `gh pr create --repo ${owner}/${repo} --head ${branchName} --base main --title "${prTitle.replace(/"/g, '\\"')}" --body "## 方案摘要\n\n${result.summary}\n\n## 变更文件\n\n${result.files.map((f: any) => "- \\`" + f.path + "\\`").join("\\n")}\n\n---\nCloses #${issueNumber}\n\n> 🤖 Generated by Devin"`,
+          { stdio: "pipe", timeout: 30000 },
+        ).toString().trim();
+
+        ghComment(owner, repo, issueNumber,
+          `## ✅ PR 已创建\n\n${prUrl}\n\n如果需要修改，请在 Issue 里 @devin 告诉我。`
+        );
+        console.log(`[devin] PR created: ${prUrl}`);
+      } catch (e) {
+        console.error(`[devin] Failed to create PR:`, e instanceof Error ? e.message : e);
+        ghComment(owner, repo, issueNumber,
+          `代码已推送到 \`${branchName}\` 分支，但 PR 创建失败。请手动创建 PR。`
+        );
+      }
     }
 
     console.log(`[devin] Completed: ${key}`);
   } catch (error) {
     console.error(`[devin] Error processing ${key}:`, error);
-    ghComment(
-      owner,
-      repo,
-      issueNumber,
-      `处理时遇到了错误：\n\n\`\`\`\n${error instanceof Error ? error.message : String(error)}\n\`\`\``,
+    ghComment(owner, repo, issueNumber,
+      `处理时遇到了错误：\n\n\`\`\`\n${error instanceof Error ? error.message : String(error)}\n\`\`\``
     );
   }
-}
-
-function buildSystemPrompt(owner: string, repo: string, issueNumber: number): string {
-  return `你是 Devin，一个 AI 软件工程师，在 GitHub 上以 bot 身份工作。
-
-你的身份：
-- 你通过 GitHub Issue 和 PR 与用户交互
-- 当前在处理 ${owner}/${repo}#${issueNumber}
-
-你的工作流程：
-1. 分析需求，如果不清晰就输出需要澄清的问题（用户会在 Issue 里回复，你会被再次调用）
-2. 制定实施方案
-3. 编写代码并确保质量
-4. 创建新的 git branch（命名: devin/issue-${issueNumber}-xxx）
-5. 提交代码并 push
-6. 用 gh CLI 创建 PR（gh pr create）
-7. 在最终输出中汇报你做了什么
-
-关键规则：
-- 始终在新 branch 上工作，不要直接提交到 main
-- 用 gh CLI 创建 PR 和评论，不要用 API
-- 你可以跑测试来验证代码
-- 如果需求不清晰，直接输出问题列表，不要猜测
-- 输出结果用中文
-
-你可以使用的工具：文件读写、代码编辑、Shell 命令（git, gh, npm 等）、文件搜索。`;
-}
-
-function buildPrompt(params: {
-  issueNumber: number;
-  issueTitle: string;
-  request: string;
-  isPR: boolean;
-  conversationHistory: string;
-  owner: string;
-  repo: string;
-}): string {
-  const { issueNumber, issueTitle, request, isPR, conversationHistory } = params;
-
-  if (isPR) {
-    return `用户在 PR #${issueNumber} 上 @devin 了你。
-
-PR 标题：${issueTitle}
-用户说：${request}
-
-请根据用户的反馈修改代码，推送到当前 PR 的 branch 上。`;
-  }
-
-  let prompt = `用户在 Issue #${issueNumber} 上 @devin 了你。
-
-Issue 标题：${issueTitle}
-用户请求：${request}`;
-
-  if (conversationHistory) {
-    prompt += `\n\n之前的对话记录：\n${conversationHistory}`;
-  }
-
-  prompt += `\n\n请分析需求并完成工作。如果需求明确，创建 branch、编写代码、push 并创建 PR。如果需求不清晰，输出你需要澄清的问题。
-
-完成后请用以下格式输出结果：
-- 你做了什么
-- 修改了哪些文件
-- PR 链接（如果创建了）`;
-
-  return prompt;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,45 +319,38 @@ app.post("/webhook", async (req, res) => {
     if (event.comment?.user?.login?.includes("[bot]")) return;
     if (event.comment?.user?.login === "github-actions") return;
 
-    const owner = event.repository.owner.login;
-    const repo = event.repository.name;
-    const issueNumber = event.issue.number;
-    const conversationHistory = ghGetComments(owner, repo, issueNumber);
-
     handleDevinMention({
-      owner,
-      repo,
-      issueNumber,
+      owner: event.repository.owner.login,
+      repo: event.repository.name,
+      issueNumber: event.issue.number,
       issueTitle: event.issue.title,
       request: body.replace(/@devin\b/gi, "").trim(),
       isPR: !!event.issue.pull_request,
-      conversationHistory,
     });
   } else if (eventType === "issues" && event.action === "opened") {
     const body: string = event.issue?.body ?? "";
     if (!body.toLowerCase().includes("@devin")) return;
 
-    const owner = event.repository.owner.login;
-    const repo = event.repository.name;
-
     handleDevinMention({
-      owner,
-      repo,
+      owner: event.repository.owner.login,
+      repo: event.repository.name,
       issueNumber: event.issue.number,
       issueTitle: event.issue.title,
       request: body.replace(/@devin\b/gi, "").trim(),
       isPR: false,
-      conversationHistory: "",
     });
   }
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", sessions: Object.keys(loadSessionMap()).length });
+  const contexts = fs.existsSync(CONTEXT_DIR)
+    ? fs.readdirSync(CONTEXT_DIR).length
+    : 0;
+  res.json({ status: "ok", activeContexts: contexts, model: LLM_MODEL });
 });
 
 app.listen(PORT, () => {
-  console.log(`[devin] Webhook server running on port ${PORT}`);
+  console.log(`[devin] Server running on port ${PORT}`);
+  console.log(`[devin] Model: ${LLM_MODEL} @ ${LLM_BASE_URL}`);
   console.log(`[devin] Workdir: ${WORKDIR}`);
-  console.log(`[devin] Webhook URL: http://localhost:${PORT}/webhook`);
 });
