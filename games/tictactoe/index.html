@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tic-Tac-Toe Game</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+        }
+
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2.5rem;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1rem;
+        }
+
+        .status {
+            font-size: 1.5rem;
+            font-weight: bold;
+            margin-bottom: 25px;
+            padding: 15px;
+            border-radius: 10px;
+            background: #f8f9fa;
+            transition: all 0.3s ease;
+        }
+
+        .status.x-turn {
+            color: #2196f3;
+            background: #e3f2fd;
+        }
+
+        .status.o-turn {
+            color: #f44336;
+            background: #ffebee;
+        }
+
+        .status.winner {
+            color: #4caf50;
+            background: #e8f5e9;
+            animation: pulse 1.5s infinite;
+        }
+
+        .status.draw {
+            color: #ff9800;
+            background: #fff3e0;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+
+        .board {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            grid-gap: 12px;
+            margin: 0 auto 30px;
+            max-width: 300px;
+        }
+
+        .cell {
+            aspect-ratio: 1;
+            background: #f5f5f5;
+            border: none;
+            border-radius: 12px;
+            font-size: 3rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #333;
+        }
+
+        .cell:hover {
+            background: #e0e0e0;
+            transform: translateY(-3px);
+        }
+
+        .cell.x {
+            color: #2196f3;
+            background: #e3f2fd;
+        }
+
+        .cell.o {
+            color: #f44336;
+            background: #ffebee;
+        }
+
+        .cell.winning {
+            background: #c8e6c9;
+            color: #2e7d32;
+            animation: winning-cell 0.5s ease infinite alternate;
+        }
+
+        @keyframes winning-cell {
+            from { background: #c8e6c9; }
+            to { background: #a5d6a7; }
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+        }
+
+        button {
+            padding: 15px 30px;
+            font-size: 1rem;
+            font-weight: bold;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .restart-btn {
+            background: #4caf50;
+            color: white;
+        }
+
+        .restart-btn:hover {
+            background: #388e3c;
+            transform: translateY(-3px);
+            box-shadow: 0 5px 15px rgba(76, 175, 80, 0.4);
+        }
+
+        .reset-btn {
+            background: #ff9800;
+            color: white;
+        }
+
+        .reset-btn:hover {
+            background: #f57c00;
+            transform: translateY(-3px);
+            box-shadow: 0 5px 15px rgba(255, 152, 0, 0.4);
+        }
+
+        footer {
+            margin-top: 30px;
+            color: #888;
+            font-size: 0.9rem;
+        }
+
+        @media (max-width: 480px) {
+            .container {
+                padding: 25px;
+            }
+            h1 {
+                font-size: 2rem;
+            }
+            .cell {
+                font-size: 2.5rem;
+            }
+            button {
+                padding: 12px 24px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⭕ Tic-Tac-Toe ❌</h1>
+        <p class="subtitle">A classic two-player game</p>
+        
+        <div class="status" id="status">Player X's Turn</div>
+        
+        <div class="board" id="board">
+            <!-- Cells will be generated by JavaScript -->
+        </div>
+        
+        <div class="controls">
+            <button class="restart-btn" id="restartBtn">Restart Game</button>
+            <button class="reset-btn" id="resetBtn">Reset Score</button>
+        </div>
+        
+        <footer>
+            <p>Score: <span id="scoreX">0</span> - <span id="scoreO">0</span> | Draws: <span id="scoreDraw">0</span></p>
+        </footer>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // Game state
+            let currentPlayer = 'X';
+            let gameBoard = ['', '', '', '', '', '', '', '', ''];
+            let gameActive = true;
+            let scores = { X: 0, O: 0, draw: 0 };
+            
+            // Winning combinations
+            const winPatterns = [
+                [0, 1, 2], [3, 4, 5], [6, 7, 8], // rows
+                [0, 3, 6], [1, 4, 7], [2, 5, 8], // columns
+                [0, 4, 8], [2, 4, 6]             // diagonals
+            ];
+            
+            // DOM elements
+            const statusElement = document.getElementById('status');
+            const boardElement = document.getElementById('board');
+            const restartBtn = document.getElementById('restartBtn');
+            const resetBtn = document.getElementById('resetBtn');
+            const scoreXElement = document.getElementById('scoreX');
+            const scoreOElement = document.getElementById('scoreO');
+            const scoreDrawElement = document.getElementById('scoreDraw');
+            
+            // Initialize the board
+            function initializeBoard() {
+                boardElement.innerHTML = '';
+                for (let i = 0; i < 9; i++) {
+                    const cell = document.createElement('button');
+                    cell.className = 'cell';
+                    cell.dataset.index = i;
+                    cell.addEventListener('click', () => handleCellClick(i));
+                    boardElement.appendChild(cell);
+                }
+                updateStatus();
+            }
+            
+            // Handle cell click
+            function handleCellClick(index) {
+                if (!gameActive || gameBoard[index] !== '') return;
+                
+                // Update game state
+                gameBoard[index] = currentPlayer;
+                const cell = boardElement.children[index];
+                cell.textContent = currentPlayer;
+                cell.classList.add(currentPlayer.toLowerCase());
+                
+                // Check for win or draw
+                if (checkWin()) {
+                    gameActive = false;
+                    highlightWinningCells();
+                    scores[currentPlayer]++;
+                    updateScores();
+                    statusElement.textContent = `Player ${currentPlayer} Wins! 🎉`;
+                    statusElement.className = 'status winner';
+                } else if (checkDraw()) {
+                    gameActive = false;
+                    scores.draw++;
+                    updateScores();
+                    statusElement.textContent = "Game Draw! 🤝";
+                    statusElement.className = 'status draw';
+                } else {
+                    // Switch player
+                    currentPlayer = currentPlayer === 'X' ? 'O' : 'X';
+                    updateStatus();
+                }
+            }
+            
+            // Check for win
+            function checkWin() {
+                for (const pattern of winPatterns) {
+                    const [a, b, c] = pattern;
+                    if (gameBoard[a] && gameBoard[a] === gameBoard[b] && gameBoard[a] === gameBoard[c]) {
+                        return pattern;
+                    }
+                }
+                return null;
+            }
+            
+            // Highlight winning cells
+            function highlightWinningCells() {
+                const winningPattern = checkWin();
+                if (winningPattern) {
+                    winningPattern.forEach(index => {
+                        boardElement.children[index].classList.add('winning');
+                    });
+                }
+            }
+            
+            // Check for draw
+            function checkDraw() {
+                return gameBoard.every(cell => cell !== '');
+            }
+            
+            // Update status display
+            function updateStatus() {
+                statusElement.textContent = `Player ${currentPlayer}'s Turn`;
+                statusElement.className = `status ${currentPlayer.toLowerCase()}-turn`;
+            }
+            
+            // Update score display
+            function updateScores() {
+                scoreXElement.textContent = scores.X;
+                scoreOElement.textContent = scores.O;
+                scoreDrawElement.textContent = scores.draw;
+            }
+            
+            // Restart game
+            function restartGame() {
+                gameBoard = ['', '', '', '', '', '', '', '', ''];
+                gameActive = true;
+                currentPlayer = 'X';
+                initializeBoard();
+            }
+            
+            // Reset scores
+            function resetScores() {
+                scores = { X: 0, O: 0, draw: 0 };
+                updateScores();
+                restartGame();
+            }
+            
+            // Event listeners
+            restartBtn.addEventListener('click', restartGame);
+            resetBtn.addEventListener('click', resetScores);
+            
+            // Load scores from localStorage
+            function loadScores() {
+                const savedScores = localStorage.getItem('tictactoe_scores');
+                if (savedScores) {
+                    scores = JSON.parse(savedScores);
+                    updateScores();
+                }
+            }
+            
+            // Save scores to localStorage
+            function saveScores() {
+                localStorage.setItem('tictactoe_scores', JSON.stringify(scores));
+            }
+            
+            // Initialize
+            loadScores();
+            initializeBoard();
+            
+            // Save scores when page is about to unload
+            window.addEventListener('beforeunload', saveScores);
+        });
+    </script>
+</body>
+</html>
