@@ -256,9 +256,11 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 ## 关键规则
 - 只输出 JSON
 - branch 命名：devin/issue-${issueNumber}-简短英文描述
-- 代码质量要高
+- 代码质量要高，写代码时就确保正确，避免后续反复修改
 - 每个 commit_file 的 content 必须是完整可用的文件内容
-- review_pr 时认真检查代码，有问题就修复后再 merge`,
+- 一轮迭代中可以批量执行多个 actions，尽量高效
+- review_pr 后如果代码没问题，立即在同一轮 merge + deploy + close
+- 不要反复 read_file 同一个文件，review_pr 的 diff 已经够用了`,
       }, {
         role: "user",
         content: `Issue 标题：${issueTitle}\nIssue 内容：${issueBody}\n\n用户请求：${request}`,
@@ -271,7 +273,7 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
     }
 
     // Agent loop: let LLM decide actions iteratively
-    const MAX_ITERATIONS = 10;
+    const MAX_ITERATIONS = 15;
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       console.log(`[devin] ${key} — iteration ${i + 1}`);
 
