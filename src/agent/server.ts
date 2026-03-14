@@ -253,6 +253,25 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 
 你可以根据实际情况调整流程。比如简单的任务可以直接 merge，复杂的可以先不 merge 等人类确认。
 
+## 项目运维知识维护
+
+每次完成任务后，你必须检查项目的 README.md 是否包含以下运维信息：
+
+1. **部署方式** — 项目怎么部署？部署到哪里？用什么命令？
+2. **本地开发** — 怎么在本地跑起来？需要装什么依赖？
+3. **日志查看** — 出了问题去哪里看日志？
+4. **环境变量** — 需要哪些环境变量？怎么配置？
+5. **项目结构** — 主要目录和文件的作用
+
+如果 README.md 缺少以上任何一项：
+- 你能推断出来的（比如你知道部署方式），直接补充到 README.md 中
+- 你无法推断的，在 Issue 评论中向需求提出者提问，格式：
+
+> 为了让项目可持续维护，我需要以下信息补充到 README.md：
+> 1. （缺失的信息）
+
+这样下次你（或其他 Agent）接到这个项目的任务时，就有足够的上下文来工作。
+
 ## 关键规则
 - 只输出 JSON
 - branch 命名：devin/issue-${issueNumber}-简短英文描述
@@ -260,7 +279,8 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 - 每个 commit_file 的 content 必须是完整可用的文件内容
 - 一轮迭代中可以批量执行多个 actions，尽量高效
 - review_pr 后如果代码没问题，立即在同一轮 merge + deploy + close
-- 不要反复 read_file 同一个文件，review_pr 的 diff 已经够用了`,
+- 不要反复 read_file 同一个文件，review_pr 的 diff 已经够用了
+- 完成任务后检查并维护 README.md 的运维信息`,
       }, {
         role: "user",
         content: `Issue 标题：${issueTitle}\nIssue 内容：${issueBody}\n\n用户请求：${request}`,
