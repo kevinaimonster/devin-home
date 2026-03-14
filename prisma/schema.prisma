@@ -1,0 +1,88 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TaskStatus {
+  analyzing
+  clarifying
+  planning
+  choosing
+  implementing
+  testing
+  pr_created
+  revising
+  merged
+  failed
+}
+
+enum IssueType {
+  feature
+  bugfix
+  refactor
+  unclear
+}
+
+model Installation {
+  id             String   @id @default(cuid())
+  githubId       Int      @unique
+  accountLogin   String
+  accountType    String   // "User" or "Organization"
+  repositorySelection String // "all" or "selected"
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  tasks          Task[]
+}
+
+model Task {
+  id              String     @id @default(cuid())
+  status          TaskStatus @default(analyzing)
+  issueType       IssueType?
+
+  // GitHub context
+  installationId  String
+  installation    Installation @relation(fields: [installationId], references: [id])
+  repoOwner       String
+  repoName        String
+  issueNumber     Int
+  issueTitle      String
+  issueBody       String     @db.Text
+  issueUrl        String
+
+  // Agent work
+  branchName      String?
+  prNumber        Int?
+  prUrl           String?
+  planSummary     String?    @db.Text
+  errorMessage    String?    @db.Text
+
+  // Metrics
+  tokenUsage      Int        @default(0)
+  startedAt       DateTime   @default(now())
+  completedAt     DateTime?
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  logs            TaskLog[]
+
+  @@index([installationId])
+  @@index([status])
+  @@index([repoOwner, repoName, issueNumber])
+}
+
+model TaskLog {
+  id        String   @id @default(cuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  phase     String   // "analyzing", "planning", "implementing", etc.
+  message   String   @db.Text
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+}
