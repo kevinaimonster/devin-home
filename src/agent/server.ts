@@ -364,6 +364,15 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 const app = express();
 app.use(express.text({ type: "application/json", limit: "10mb" }));
 
+// CORS for Dashboard
+app.use((_req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
+  next();
+});
+
 app.post("/webhook", async (req, res) => {
   const signature = (req.headers["x-hub-signature-256"] as string) ?? "";
   const rawBody = req.body as string;
@@ -406,6 +415,133 @@ app.post("/webhook", async (req, res) => {
       request: body.replace(/@devin\b/gi, "").trim(),
       isPR: false,
     });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Dashboard API endpoints
+// ---------------------------------------------------------------------------
+
+interface TaskSummary {
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  messageCount: number;
+  lastUpdated: string | null;
+  status: "working" | "waiting" | "done" | "error" | "unknown";
+  lastAssistantPreview: string;
+}
+
+function inferStatus(messages: Message[]): TaskSummary["status"] {
+  // Find the last assistant message
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === "assistant") {
+      try {
+        const parsed = parseJSON(msg.content);
+        if (parsed.done === true) return "done";
+        if (parsed.actions && parsed.actions.length > 0) return "working";
+      } catch {
+        // If we can't parse, check for error patterns
+        if (msg.content.includes("error") || msg.content.includes("failed")) return "error";
+      }
+      return "working";
+    }
+  }
+  // If last message is from user (waiting for assistant response), it's waiting
+  if (messages.length > 0 && messages[messages.length - 1].role === "user") return "waiting";
+  return "unknown";
+}
+
+function getLastAssistantPreview(messages: Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") {
+      try {
+        const parsed = parseJSON(messages[i].content);
+        if (parsed.thinking) return parsed.thinking.slice(0, 120);
+        if (parsed.actions && parsed.actions.length > 0) {
+          return parsed.actions.map((a: any) => a.action).join(", ");
+        }
+      } catch {}
+      return messages[i].content.slice(0, 120);
+    }
+  }
+  return "";
+}
+
+app.get("/api/tasks", (_req, res) => {
+  try {
+    if (!fs.existsSync(CONTEXT_DIR)) {
+      res.json([]);
+      return;
+    }
+    const files = fs.readdirSync(CONTEXT_DIR).filter(f => f.endsWith(".json"));
+    const tasks: TaskSummary[] = [];
+
+    for (const file of files) {
+      const match = file.replace(".json", "").match(/^(.+?)_(.+?)_(\d+)$/);
+      if (!match) continue;
+
+      const [, owner, repo, issueStr] = match;
+      const issueNumber = parseInt(issueStr!, 10);
+      const filePath = path.join(CONTEXT_DIR, file);
+
+      let messages: Message[] = [];
+      try {
+        messages = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      } catch { continue; }
+
+      // Get file mtime as last updated
+      const stat = fs.statSync(filePath);
+
+      tasks.push({
+        owner: owner!,
+        repo: repo!,
+        issueNumber,
+        messageCount: messages.length,
+        lastUpdated: stat.mtime.toISOString(),
+        status: inferStatus(messages),
+        lastAssistantPreview: getLastAssistantPreview(messages),
+      });
+    }
+
+    // Sort by last updated descending
+    tasks.sort((a, b) => {
+      if (!a.lastUpdated || !b.lastUpdated) return 0;
+      return new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime();
+    });
+
+    res.json(tasks);
+  } catch (e) {
+    console.error("[devin] /api/tasks error:", e);
+    res.status(500).json({ error: "Failed to list tasks" });
+  }
+});
+
+app.get("/api/tasks/:owner/:repo/:issueNumber", (req, res) => {
+  try {
+    const { owner, repo, issueNumber } = req.params;
+    const filePath = path.join(CONTEXT_DIR, `${owner}_${repo}_${issueNumber}.json`);
+
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: "Task not found" });
+      return;
+    }
+
+    const messages: Message[] = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    const stat = fs.statSync(filePath);
+
+    res.json({
+      owner,
+      repo,
+      issueNumber: parseInt(issueNumber!, 10),
+      messages,
+      lastUpdated: stat.mtime.toISOString(),
+      status: inferStatus(messages),
+    });
+  } catch (e) {
+    console.error("[devin] /api/tasks/:id error:", e);
+    res.status(500).json({ error: "Failed to load task" });
   }
 });
 
