@@ -226,7 +226,7 @@ ${projectContext ? `项目说明：\n${projectContext}` : ""}
     if (result.action === "clarify") {
       const questions = (result.questions as string[]).map((q, i) => `${i + 1}. ${q}`).join("\n");
       ghComment(owner, repo, issueNumber,
-        `我需要更多信息来开始工作：\n\n${questions}\n\n请回复后 @devin 我会继续。`
+        `我需要更多信息来开始工作：\n\n${questions}\n\n请回复后告诉我，我会继续。`
       );
       console.log(`[devin] Clarifying: ${key}`);
       return;
@@ -272,7 +272,7 @@ ${projectContext ? `项目说明：\n${projectContext}` : ""}
         ).toString().trim();
 
         ghComment(owner, repo, issueNumber,
-          `## ✅ PR 已创建\n\n${prUrl}\n\n如果需要修改，请在 Issue 里 @devin 告诉我。`
+          `## ✅ PR 已创建\n\n${prUrl}\n\n如果需要修改，请在 Issue 里告诉我。`
         );
         console.log(`[devin] PR created: ${prUrl}`);
       } catch (e) {
@@ -316,8 +316,14 @@ app.post("/webhook", async (req, res) => {
   if (eventType === "issue_comment" && event.action === "created") {
     const body: string = event.comment?.body ?? "";
     if (!body.toLowerCase().includes("@devin")) return;
-    if (event.comment?.user?.login?.includes("[bot]")) return;
-    if (event.comment?.user?.login === "github-actions") return;
+
+    // Ignore bot comments and Devin's own comments
+    const commenter = event.comment?.user?.login ?? "";
+    if (commenter.includes("[bot]")) return;
+    if (commenter === "github-actions") return;
+
+    // Ignore comments that look like Devin's own output
+    if (body.startsWith("🤖") || body.startsWith("## 📋") || body.startsWith("## ✅") || body.includes("正在处理中") || body.includes("正在分析需求")) return;
 
     handleDevinMention({
       owner: event.repository.owner.login,
