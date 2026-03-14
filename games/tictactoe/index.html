@@ -258,9 +258,10 @@
                 cell.classList.add(currentPlayer.toLowerCase());
                 
                 // Check for win or draw
-                if (checkWin()) {
+                const winningPattern = checkWin();
+                if (winningPattern) {
                     gameActive = false;
-                    highlightWinningCells();
+                    highlightWinningCells(winningPattern);
                     scores[currentPlayer]++;
                     updateScores();
                     statusElement.textContent = `Player ${currentPlayer} Wins! 🎉`;
@@ -290,13 +291,10 @@
             }
             
             // Highlight winning cells
-            function highlightWinningCells() {
-                const winningPattern = checkWin();
-                if (winningPattern) {
-                    winningPattern.forEach(index => {
-                        boardElement.children[index].classList.add('winning');
-                    });
-                }
+            function highlightWinningCells(winningPattern) {
+                winningPattern.forEach(index => {
+                    boardElement.children[index].classList.add('winning');
+                });
             }
             
             // Check for draw
@@ -315,6 +313,7 @@
                 scoreXElement.textContent = scores.X;
                 scoreOElement.textContent = scores.O;
                 scoreDrawElement.textContent = scores.draw;
+                saveScores();
             }
             
             // Restart game
@@ -322,7 +321,15 @@
                 gameBoard = ['', '', '', '', '', '', '', '', ''];
                 gameActive = true;
                 currentPlayer = 'X';
-                initializeBoard();
+                
+                // Clear board UI
+                Array.from(boardElement.children).forEach(cell => {
+                    cell.textContent = '';
+                    cell.className = 'cell';
+                    cell.classList.remove('winning');
+                });
+                
+                updateStatus();
             }
             
             // Reset scores
@@ -338,24 +345,29 @@
             
             // Load scores from localStorage
             function loadScores() {
-                const savedScores = localStorage.getItem('tictactoe_scores');
-                if (savedScores) {
-                    scores = JSON.parse(savedScores);
-                    updateScores();
+                try {
+                    const savedScores = localStorage.getItem('tictactoe_scores');
+                    if (savedScores) {
+                        scores = JSON.parse(savedScores);
+                        updateScores();
+                    }
+                } catch (e) {
+                    console.log('Failed to load scores:', e);
                 }
             }
             
             // Save scores to localStorage
             function saveScores() {
-                localStorage.setItem('tictactoe_scores', JSON.stringify(scores));
+                try {
+                    localStorage.setItem('tictactoe_scores', JSON.stringify(scores));
+                } catch (e) {
+                    console.log('Failed to save scores:', e);
+                }
             }
             
             // Initialize
             loadScores();
             initializeBoard();
-            
-            // Save scores when page is about to unload
-            window.addEventListener('beforeunload', saveScores);
         });
     </script>
 </body>
