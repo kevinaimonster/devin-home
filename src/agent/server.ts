@@ -284,13 +284,10 @@ function execAction(action: any, owner: string, repo: string, issueNumber: numbe
 }
 
 // ---------------------------------------------------------------------------
-// Core: autonomous agent loop
+// Task queue
 // ---------------------------------------------------------------------------
 
-// Track active tasks to prevent duplicate processing
-const activeTasks = new Set<string>();
-
-async function handleDevinMention(params: {
+interface QueuedTask {
   owner: string;
   repo: string;
   issueNumber: number;
@@ -298,21 +295,98 @@ async function handleDevinMention(params: {
   request: string;
   isPR: boolean;
   commentId?: number;
-}) {
-  const { owner, repo, issueNumber, issueTitle, request, isPR, commentId } = params;
-  const key = `${owner}/${repo}#${issueNumber}`;
+}
 
-  // Prevent duplicate processing
+const taskQueue: QueuedTask[] = [];
+const activeTasks = new Set<string>();
+let queueProcessing = false;
+
+function enqueueTask(task: QueuedTask) {
+  const key = `${task.owner}/${task.repo}#${task.issueNumber}`;
+  // If this exact issue is already active, queue it for later
   if (activeTasks.has(key)) {
-    console.log(`[devin] ${key} already being processed, skipping`);
+    console.log(`[devin] ${key} active, queuing for later`);
+    taskQueue.push(task);
     return;
   }
+  processTask(task);
+}
+
+async function processTask(task: QueuedTask) {
+  await handleDevinMention(task);
+  // After finishing, check if there's a queued task for the same or different issue
+  if (taskQueue.length > 0) {
+    const next = taskQueue.shift()!;
+    console.log(`[devin] Processing next queued task: ${next.owner}/${next.repo}#${next.issueNumber}`);
+    processTask(next);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// User directive parsing
+// ---------------------------------------------------------------------------
+
+interface UserDirectives {
+  noMerge: boolean;   // --no-merge: create PR but don't auto-merge
+  draft: boolean;     // --draft: create draft PR
+  noClose: boolean;   // --no-close: don't close issue after merge
+  request: string;    // the actual request without directives
+}
+
+function parseDirectives(raw: string): UserDirectives {
+  const directives: UserDirectives = { noMerge: false, draft: false, noClose: false, request: raw };
+  directives.noMerge = /--no-?merge/i.test(raw);
+  directives.draft = /--draft/i.test(raw);
+  directives.noClose = /--no-?close/i.test(raw);
+  directives.request = raw.replace(/--no-?merge|--draft|--no-?close/gi, "").trim();
+  return directives;
+}
+
+// ---------------------------------------------------------------------------
+// Smart context collection
+// ---------------------------------------------------------------------------
+
+function collectProjectContext(owner: string, repo: string): string {
+  const parts: string[] = [];
+
+  // package.json — framework, dependencies
+  const pkgJson = ghSafe(`gh api repos/${owner}/${repo}/contents/package.json --jq .content | base64 -d`);
+  if (pkgJson) {
+    try {
+      const pkg = JSON.parse(pkgJson);
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      const depNames = Object.keys(deps).slice(0, 30).join(", ");
+      parts.push(`Framework/Dependencies: ${depNames}`);
+      if (pkg.scripts) parts.push(`Scripts: ${Object.keys(pkg.scripts).join(", ")}`);
+    } catch {}
+  }
+
+  // tsconfig.json — TypeScript config
+  const tsconfig = ghSafe(`gh api repos/${owner}/${repo}/contents/tsconfig.json --jq .content | base64 -d`);
+  if (tsconfig) parts.push("TypeScript project detected.");
+
+  // .devin/config.yml — custom Devin config (future)
+  const devinConfig = ghSafe(`gh api repos/${owner}/${repo}/contents/.devin/config.yml --jq .content | base64 -d`);
+  if (devinConfig) parts.push(`Devin config:\n${devinConfig}`);
+
+  return parts.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Core: autonomous agent loop
+// ---------------------------------------------------------------------------
+
+async function handleDevinMention(task: QueuedTask) {
+  const { owner, repo, issueNumber, issueTitle, isPR, commentId } = task;
+  const directives = parseDirectives(task.request);
+  const request = directives.request;
+  const key = `${owner}/${repo}#${issueNumber}`;
+
   activeTasks.add(key);
   const startTime = Date.now();
 
-  console.log(`[devin] Processing: ${key}`);
+  console.log(`[devin] Processing: ${key}${directives.noMerge ? " (no-merge)" : ""}${directives.draft ? " (draft)" : ""}`);
 
-  // React to the triggering comment with 🚀
   if (commentId) {
     ghReaction(owner, repo, commentId, "rocket");
   }
@@ -324,8 +398,8 @@ async function handleDevinMention(params: {
       const fileTree = ghSafe(`gh api repos/${owner}/${repo}/git/trees/main?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' | head -100`);
       const projectContext = ghSafe(`gh api repos/${owner}/${repo}/contents/README.md --jq .content | base64 -d`);
       const issueBody = ghSafe(`gh issue view ${issueNumber} --repo ${owner}/${repo} --json body --jq .body`);
-      // Load project memory for cross-issue context
       const projectMemory = ghSafe(`gh api repos/${owner}/${repo}/contents/.devin/memory.md --jq .content | base64 -d`);
+      const techContext = collectProjectContext(owner, repo);
 
       messages = [{
         role: "system",
@@ -338,6 +412,10 @@ Issue #${issueNumber}：${issueTitle}
 ${fileTree || "(空项目)"}
 ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 ${projectMemory ? `\n项目记忆（来自 .devin/memory.md，包含跨 Issue 的经验和知识）：\n${projectMemory}` : ""}
+${techContext ? `\n技术栈信息：\n${techContext}` : ""}
+${directives.noMerge ? "\n⚠️ 用户指令：--no-merge，创建 PR 后不要自动合并，等人类 review。" : ""}
+${directives.draft ? "\n⚠️ 用户指令：--draft，创建 Draft PR。" : ""}
+${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue。" : ""}
 
 ## 你可以执行的动作
 
@@ -541,7 +619,7 @@ app.post("/webhook", async (req, res) => {
     if (commenter === "github-actions") return;
     if (body.startsWith("🤖") || body.startsWith("## 📋") || body.startsWith("## ✅") || body.includes("正在处理中") || body.includes("正在分析需求")) return;
 
-    handleDevinMention({
+    enqueueTask({
       owner: event.repository.owner.login,
       repo: event.repository.name,
       issueNumber: event.issue.number,
@@ -554,7 +632,7 @@ app.post("/webhook", async (req, res) => {
     const body: string = event.issue?.body ?? "";
     if (!body.toLowerCase().includes("@devin")) return;
 
-    handleDevinMention({
+    enqueueTask({
       owner: event.repository.owner.login,
       repo: event.repository.name,
       issueNumber: event.issue.number,
@@ -665,6 +743,7 @@ app.get("/health", (_req, res) => {
     status: "ok",
     activeContexts: contexts,
     activeTasks: Array.from(activeTasks),
+    queuedTasks: taskQueue.length,
     model: LLM_MODEL,
   });
 });
