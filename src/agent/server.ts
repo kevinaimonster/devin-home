@@ -328,7 +328,8 @@ interface QueuedTask {
 
 const taskQueue: QueuedTask[] = [];
 const activeTasks = new Set<string>();
-let queueProcessing = false;
+const rateLimitMap = new Map<string, number>(); // key → last trigger timestamp
+const RATE_LIMIT_MS = 60_000; // 60 seconds cooldown per issue
 
 function enqueueTask(task: QueuedTask) {
   // Handle --help
@@ -338,6 +339,15 @@ function enqueueTask(task: QueuedTask) {
   }
 
   const key = `${task.owner}/${task.repo}#${task.issueNumber}`;
+
+  // Rate limiting
+  const lastTrigger = rateLimitMap.get(key) ?? 0;
+  if (Date.now() - lastTrigger < RATE_LIMIT_MS) {
+    console.log(`[devin] ${key} rate limited (${Math.round((RATE_LIMIT_MS - (Date.now() - lastTrigger)) / 1000)}s cooldown remaining)`);
+    return;
+  }
+  rateLimitMap.set(key, Date.now());
+
   if (activeTasks.has(key)) {
     console.log(`[devin] ${key} active, queuing for later`);
     taskQueue.push(task);
