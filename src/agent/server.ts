@@ -209,8 +209,8 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
         return `Validation failed:\n${allIssues.join("\n")}\nFix the code and retry.`;
       }
 
-      // Get base tree
-      const baseSha = gh(`gh api repos/${owner}/${repo}/git/ref/heads/${branch} --jq .object.sha`);
+      // Get base tree — use matching-refs endpoint to handle branch names with slashes
+      const baseSha = gh(`gh api repos/${owner}/${repo}/git/matching-refs/heads/${branch} --jq '.[0].object.sha'`);
       const baseTreeSha = gh(`gh api repos/${owner}/${repo}/git/commits/${baseSha} --jq .tree.sha`);
 
       // Create blobs and build tree entries
@@ -235,8 +235,9 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
       const newCommitSha = gh(`gh api repos/${owner}/${repo}/git/commits --method POST --input ${tmpCommitFile} --jq .sha`);
       fs.unlinkSync(tmpCommitFile);
 
-      // Update branch ref
-      gh(`gh api repos/${owner}/${repo}/git/refs/heads/${branch} --method PATCH -f sha="${newCommitSha}"`);
+      // Update branch ref — use matching-refs to handle branch names with slashes
+      const refSha = gh(`gh api repos/${owner}/${repo}/git/matching-refs/heads/${branch} --jq '.[0].ref'`);
+      gh(`gh api repos/${owner}/${repo}/git/${refSha} --method PATCH -f sha="${newCommitSha}"`);
 
       return `Atomically committed ${files.length} files to ${branch}: ${files.map(f => f.path).join(", ")}`;
     }
