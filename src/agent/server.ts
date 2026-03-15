@@ -87,11 +87,49 @@ function ghComment(owner: string, repo: string, issueNumber: number, body: strin
   }
 }
 
+function ghReaction(owner: string, repo: string, commentId: number, reaction: string) {
+  ghSafe(`gh api repos/${owner}/${repo}/issues/comments/${commentId}/reactions --method POST -f content="${reaction}"`);
+}
+
 function ghCreateFile(owner: string, repo: string, filePath: string, content: string, branch: string, message: string) {
   const encoded = Buffer.from(content).toString("base64");
   const sha = ghSafe(`gh api repos/${owner}/${repo}/contents/${filePath}?ref=${branch} --jq .sha`);
   const shaFlag = sha ? `-f sha="${sha}"` : "";
   gh(`gh api repos/${owner}/${repo}/contents/${filePath} --method PUT -f message="${message.replace(/"/g, '\\"')}" -f content="${encoded}" -f branch="${branch}" ${shaFlag}`);
+}
+
+// ---------------------------------------------------------------------------
+// Code validation
+// ---------------------------------------------------------------------------
+
+function validateCode(filePath: string, content: string): string[] {
+  const issues: string[] = [];
+  const ext = path.extname(filePath).toLowerCase();
+
+  if ([".ts", ".tsx", ".js", ".jsx", ".css", ".html"].includes(ext)) {
+    // Bracket matching
+    const opens = (content.match(/[{(\[]/g) ?? []).length;
+    const closes = (content.match(/[})\]]/g) ?? []).length;
+    if (opens !== closes) {
+      issues.push(`Bracket mismatch: ${opens} opening vs ${closes} closing`);
+    }
+  }
+
+  if ([".json"].includes(ext)) {
+    try { JSON.parse(content); }
+    catch (e) { issues.push(`Invalid JSON: ${e instanceof Error ? e.message : String(e)}`); }
+  }
+
+  if (content.trim().length === 0) {
+    issues.push("File is empty");
+  }
+
+  // Check for common LLM artifacts
+  if (content.includes("```")) {
+    issues.push("Contains markdown code fences — likely raw LLM output");
+  }
+
+  return issues;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +147,6 @@ async function chat(messages: Message[]): Promise<string> {
 }
 
 function parseJSON(text: string): any {
-  // Try to extract JSON from potential markdown wrapping
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   let cleaned = jsonMatch ? jsonMatch[1]!.trim() : text.trim();
   const braceMatch = cleaned.match(/\{[\s\S]*\}/);
@@ -118,7 +155,7 @@ function parseJSON(text: string): any {
 }
 
 // ---------------------------------------------------------------------------
-// Actions: each action Devin can take
+// Actions
 // ---------------------------------------------------------------------------
 
 function execAction(action: any, owner: string, repo: string, issueNumber: number): string {
@@ -134,8 +171,60 @@ function execAction(action: any, owner: string, repo: string, issueNumber: numbe
     }
 
     case "commit_file": {
+      // Validate code before committing
+      const issues = validateCode(action.path, action.content);
+      if (issues.length > 0) {
+        return `Validation failed for ${action.path}: ${issues.join("; ")}. Fix the code and retry.`;
+      }
       ghCreateFile(owner, repo, action.path, action.content, action.branch, action.message || `Update ${action.path}`);
       return `Committed ${action.path} to ${action.branch}.`;
+    }
+
+    case "commit_files": {
+      // Atomic multi-file commit via Git Tree API
+      const branch: string = action.branch;
+      const files: Array<{ path: string; content: string }> = action.files;
+
+      // Validate all files first
+      const allIssues: string[] = [];
+      for (const f of files) {
+        const issues = validateCode(f.path, f.content);
+        if (issues.length > 0) allIssues.push(`${f.path}: ${issues.join("; ")}`);
+      }
+      if (allIssues.length > 0) {
+        return `Validation failed:\n${allIssues.join("\n")}\nFix the code and retry.`;
+      }
+
+      // Get base tree
+      const baseSha = gh(`gh api repos/${owner}/${repo}/git/ref/heads/${branch} --jq .object.sha`);
+      const baseTreeSha = gh(`gh api repos/${owner}/${repo}/git/commits/${baseSha} --jq .tree.sha`);
+
+      // Create blobs and build tree entries
+      const treeEntries: string[] = [];
+      for (const f of files) {
+        const encoded = Buffer.from(f.content).toString("base64");
+        const blobSha = gh(`gh api repos/${owner}/${repo}/git/blobs --method POST -f content="${encoded}" -f encoding="base64" --jq .sha`);
+        treeEntries.push(`{"path":"${f.path}","mode":"100644","type":"blob","sha":"${blobSha}"}`);
+      }
+
+      // Create tree
+      const treeJson = `[${treeEntries.join(",")}]`;
+      const tmpTreeFile = path.join(WORKDIR, `.tree-${Date.now()}.json`);
+      fs.writeFileSync(tmpTreeFile, JSON.stringify({ base_tree: baseTreeSha, tree: JSON.parse(treeJson) }));
+      const newTreeSha = gh(`gh api repos/${owner}/${repo}/git/trees --method POST --input ${tmpTreeFile} --jq .sha`);
+      fs.unlinkSync(tmpTreeFile);
+
+      // Create commit
+      const message = action.message || `Add ${files.length} files\n\nPart of #${issueNumber}`;
+      const tmpCommitFile = path.join(WORKDIR, `.commit-${Date.now()}.json`);
+      fs.writeFileSync(tmpCommitFile, JSON.stringify({ message, tree: newTreeSha, parents: [baseSha] }));
+      const newCommitSha = gh(`gh api repos/${owner}/${repo}/git/commits --method POST --input ${tmpCommitFile} --jq .sha`);
+      fs.unlinkSync(tmpCommitFile);
+
+      // Update branch ref
+      gh(`gh api repos/${owner}/${repo}/git/refs/heads/${branch} --method PATCH -f sha="${newCommitSha}"`);
+
+      return `Atomically committed ${files.length} files to ${branch}: ${files.map(f => f.path).join(", ")}`;
     }
 
     case "create_pr": {
@@ -147,9 +236,8 @@ function execAction(action: any, owner: string, repo: string, issueNumber: numbe
     }
 
     case "review_pr": {
-      // Self-review: read the PR diff and provide review
       const diff = ghSafe(`gh pr diff ${action.pr_number} --repo ${owner}/${repo}`);
-      return `PR #${action.pr_number} diff:\n${diff.slice(0, 3000)}`;
+      return `PR #${action.pr_number} diff:\n${diff.slice(0, 4000)}`;
     }
 
     case "merge_pr": {
@@ -163,15 +251,14 @@ function execAction(action: any, owner: string, repo: string, issueNumber: numbe
     }
 
     case "deploy_pages": {
-      // Enable GitHub Pages on the repo (serves from main branch root or /docs)
       ghSafe(`gh api repos/${owner}/${repo}/pages --method POST -f source='{"branch":"main","path":"/"}' 2>/dev/null`);
       const pagesUrl = ghSafe(`gh api repos/${owner}/${repo}/pages --jq .html_url`);
-      return pagesUrl ? `GitHub Pages deployed: ${pagesUrl}` : "GitHub Pages deployment initiated (may take a minute).";
+      return pagesUrl ? `GitHub Pages deployed: ${pagesUrl}` : "GitHub Pages deployment initiated.";
     }
 
     case "read_file": {
       const content = ghSafe(`gh api repos/${owner}/${repo}/contents/${action.path}?ref=${action.ref || "main"} --jq .content | base64 -d`);
-      return content ? `Content of ${action.path}:\n${content.slice(0, 3000)}` : `File ${action.path} not found.`;
+      return content ? `Content of ${action.path}:\n${content.slice(0, 4000)}` : `File ${action.path} not found.`;
     }
 
     case "list_files": {
@@ -188,6 +275,9 @@ function execAction(action: any, owner: string, repo: string, issueNumber: numbe
 // Core: autonomous agent loop
 // ---------------------------------------------------------------------------
 
+// Track active tasks to prevent duplicate processing
+const activeTasks = new Set<string>();
+
 async function handleDevinMention(params: {
   owner: string;
   repo: string;
@@ -195,17 +285,32 @@ async function handleDevinMention(params: {
   issueTitle: string;
   request: string;
   isPR: boolean;
+  commentId?: number;
 }) {
-  const { owner, repo, issueNumber, issueTitle, request, isPR } = params;
+  const { owner, repo, issueNumber, issueTitle, request, isPR, commentId } = params;
   const key = `${owner}/${repo}#${issueNumber}`;
+
+  // Prevent duplicate processing
+  if (activeTasks.has(key)) {
+    console.log(`[devin] ${key} already being processed, skipping`);
+    return;
+  }
+  activeTasks.add(key);
+  const startTime = Date.now();
+
   console.log(`[devin] Processing: ${key}`);
+
+  // React to the triggering comment with 🚀
+  if (commentId) {
+    ghReaction(owner, repo, commentId, "rocket");
+  }
 
   try {
     let messages = loadContext(owner, repo, issueNumber);
 
     if (messages.length === 0) {
-      let fileTree = ghSafe(`gh api repos/${owner}/${repo}/git/trees/main?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' | head -100`);
-      let projectContext = ghSafe(`gh api repos/${owner}/${repo}/contents/README.md --jq .content | base64 -d`);
+      const fileTree = ghSafe(`gh api repos/${owner}/${repo}/git/trees/main?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' | head -100`);
+      const projectContext = ghSafe(`gh api repos/${owner}/${repo}/contents/README.md --jq .content | base64 -d`);
       const issueBody = ghSafe(`gh issue view ${issueNumber} --repo ${owner}/${repo} --json body --jq .body`);
 
       messages = [{
@@ -224,9 +329,10 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 你每次回复一个 JSON 对象，包含 "actions" 数组和 "done" 标志。系统会依次执行每个 action 并把结果反馈给你，你可以根据结果决定下一步。
 
 可用 actions：
-- {"action": "comment", "body": "评论内容"} — 在 Issue 上发评论
+- {"action": "comment", "body": "评论内容"} — 在 Issue 上发评论（用于汇报进度）
 - {"action": "create_branch", "branch": "分支名"} — 创建新分支
-- {"action": "commit_file", "branch": "分支名", "path": "文件路径", "content": "完整文件内容", "message": "commit 信息"} — 提交文件
+- {"action": "commit_file", "branch": "分支名", "path": "文件路径", "content": "完整文件内容", "message": "commit 信息"} — 提交单个文件（会做语法校验）
+- {"action": "commit_files", "branch": "分支名", "files": [{"path": "路径", "content": "内容"}], "message": "commit 信息"} — 原子提交多个文件（推荐，所有文件在一个 commit 中）
 - {"action": "create_pr", "branch": "分支名", "title": "PR标题", "body": "PR描述"} — 创建 PR
 - {"action": "review_pr", "pr_number": N} — 读取 PR diff 进行自我审查
 - {"action": "merge_pr", "pr_number": N} — 合并 PR（squash merge + 删除分支）
@@ -244,43 +350,28 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 ## 工作流程（你自主决定）
 
 典型流程：
-1. 分析需求，如果不清晰就 comment 提问然后 done=true 等用户回复
-2. create_branch → 多个 commit_file → create_pr
-3. review_pr 自我审查代码质量
-4. 如果审查通过：merge_pr → close_issue
-5. 如果项目是静态网页：deploy_pages
-6. 最后 comment 汇报结果
+1. 先 comment 告知用户你在做什么（第一轮就要评论，让用户看到进度）
+2. create_branch → commit_files（推荐用原子提交） → create_pr
+3. review_pr 自我审查
+4. 审查通过：merge_pr → close_issue → deploy_pages（如适用）
+5. 最后 comment 汇报完成情况
 
-你可以根据实际情况调整流程。比如简单的任务可以直接 merge，复杂的可以先不 merge 等人类确认。
+如果需求不清晰，comment 提问然后 done=true 等用户回复。
 
 ## 项目运维知识维护
 
-每次完成任务后，你必须检查项目的 README.md 是否包含以下运维信息：
-
-1. **部署方式** — 项目怎么部署？部署到哪里？用什么命令？
-2. **本地开发** — 怎么在本地跑起来？需要装什么依赖？
-3. **日志查看** — 出了问题去哪里看日志？
-4. **环境变量** — 需要哪些环境变量？怎么配置？
-5. **项目结构** — 主要目录和文件的作用
-
-如果 README.md 缺少以上任何一项：
-- 你能推断出来的（比如你知道部署方式），直接补充到 README.md 中
-- 你无法推断的，在 Issue 评论中向需求提出者提问，格式：
-
-> 为了让项目可持续维护，我需要以下信息补充到 README.md：
-> 1. （缺失的信息）
-
-这样下次你（或其他 Agent）接到这个项目的任务时，就有足够的上下文来工作。
+完成任务后，检查 README.md 是否包含：部署方式、本地开发、日志查看、环境变量、项目结构。缺失的要补充或提问。
 
 ## 关键规则
 - 只输出 JSON
 - branch 命名：devin/issue-${issueNumber}-简短英文描述
-- 代码质量要高，写代码时就确保正确，避免后续反复修改
-- 每个 commit_file 的 content 必须是完整可用的文件内容
-- 一轮迭代中可以批量执行多个 actions，尽量高效
-- review_pr 后如果代码没问题，立即在同一轮 merge + deploy + close
-- 不要反复 read_file 同一个文件，review_pr 的 diff 已经够用了
-- 完成任务后检查并维护 README.md 的运维信息`,
+- 代码质量要高，写代码时就确保正确
+- 每个文件的 content 必须是完整可用的代码（系统会自动做语法校验，不通过会拒绝提交）
+- 优先用 commit_files 原子提交多个文件
+- 一轮迭代中尽量批量执行多个 actions
+- review_pr 后如果代码没问题，立即在同一轮 merge + close
+- 不要反复 read_file 同一个文件
+- 如果某个 action 失败了，分析原因后重试或换一种方式`,
       }, {
         role: "user",
         content: `Issue 标题：${issueTitle}\nIssue 内容：${issueBody}\n\n用户请求：${request}`,
@@ -292,10 +383,13 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
       });
     }
 
-    // Agent loop: let LLM decide actions iteratively
+    // Agent loop
     const MAX_ITERATIONS = 15;
+    let totalActions = 0;
+    let failedActions = 0;
+
     for (let i = 0; i < MAX_ITERATIONS; i++) {
-      console.log(`[devin] ${key} — iteration ${i + 1}`);
+      console.log(`[devin] ${key} — iteration ${i + 1}/${MAX_ITERATIONS}`);
 
       const response = await chat(messages);
       messages.push({ role: "assistant", content: response });
@@ -306,37 +400,51 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
         parsed = parseJSON(response);
       } catch {
         console.error(`[devin] Failed to parse LLM response:`, response.slice(0, 200));
-        break;
+        // Retry once: tell LLM to fix its output
+        messages.push({ role: "user", content: "Your response was not valid JSON. Please respond with a valid JSON object: {\"actions\": [...], \"thinking\": \"...\", \"done\": false}" });
+        saveContext(owner, repo, issueNumber, messages);
+        continue;
       }
 
       if (parsed.thinking) {
-        console.log(`[devin] Thinking: ${parsed.thinking.slice(0, 100)}`);
+        console.log(`[devin] Thinking: ${parsed.thinking.slice(0, 120)}`);
       }
 
-      // Execute actions and collect results
       const actions: any[] = parsed.actions ?? [];
       const results: string[] = [];
 
       for (const action of actions) {
+        totalActions++;
+        const actionLabel = `${action.action}${action.path ? ` ${action.path}` : ""}${action.pr_number ? ` #${action.pr_number}` : ""}`;
+
         try {
-          console.log(`[devin] Executing: ${action.action}${action.path ? ` ${action.path}` : ""}${action.pr_number ? ` #${action.pr_number}` : ""}`);
+          console.log(`[devin] Executing: ${actionLabel}`);
           const result = execAction(action, owner, repo, issueNumber);
-          results.push(`✓ ${action.action}: ${result}`);
-          console.log(`[devin] ✓ ${action.action}`);
+
+          // Check if validation failed (returned as result, not thrown)
+          if (result.startsWith("Validation failed")) {
+            results.push(`⚠ ${action.action}: ${result}`);
+            failedActions++;
+            console.warn(`[devin] ⚠ ${actionLabel}: validation failed`);
+          } else {
+            results.push(`✓ ${action.action}: ${result}`);
+            console.log(`[devin] ✓ ${actionLabel}`);
+          }
         } catch (e) {
+          failedActions++;
           const errMsg = e instanceof Error ? e.message : String(e);
           results.push(`✗ ${action.action} failed: ${errMsg}`);
-          console.error(`[devin] ✗ ${action.action}: ${errMsg}`);
+          console.error(`[devin] ✗ ${actionLabel}: ${errMsg}`);
         }
       }
 
-      // Check if done
       if (parsed.done === true) {
-        console.log(`[devin] ${key} — done`);
+        // Post completion stats
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+        console.log(`[devin] ${key} — done (${elapsed}s, ${totalActions} actions, ${failedActions} failed)`);
         break;
       }
 
-      // Feed results back to LLM for next iteration
       if (results.length > 0) {
         messages.push({
           role: "user",
@@ -348,12 +456,15 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
       }
     }
 
-    console.log(`[devin] Completed: ${key}`);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+    console.log(`[devin] Completed: ${key} (${elapsed}s total)`);
   } catch (error) {
     console.error(`[devin] Error: ${key}:`, error);
     ghComment(owner, repo, issueNumber,
       `处理时遇到了错误：\n\n\`\`\`\n${error instanceof Error ? error.message : String(error)}\n\`\`\``
     );
+  } finally {
+    activeTasks.delete(key);
   }
 }
 
@@ -402,6 +513,7 @@ app.post("/webhook", async (req, res) => {
       issueTitle: event.issue.title,
       request: body.replace(/@devin\b/gi, "").trim(),
       isPR: !!event.issue.pull_request,
+      commentId: event.comment?.id,
     });
   } else if (eventType === "issues" && event.action === "opened") {
     const body: string = event.issue?.body ?? "";
@@ -433,7 +545,6 @@ interface TaskSummary {
 }
 
 function inferStatus(messages: Message[]): TaskSummary["status"] {
-  // Find the last assistant message
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.role === "assistant") {
@@ -442,13 +553,11 @@ function inferStatus(messages: Message[]): TaskSummary["status"] {
         if (parsed.done === true) return "done";
         if (parsed.actions && parsed.actions.length > 0) return "working";
       } catch {
-        // If we can't parse, check for error patterns
         if (msg.content.includes("error") || msg.content.includes("failed")) return "error";
       }
       return "working";
     }
   }
-  // If last message is from user (waiting for assistant response), it's waiting
   if (messages.length > 0 && messages[messages.length - 1].role === "user") return "waiting";
   return "unknown";
 }
@@ -471,46 +580,26 @@ function getLastAssistantPreview(messages: Message[]): string {
 
 app.get("/api/tasks", (_req, res) => {
   try {
-    if (!fs.existsSync(CONTEXT_DIR)) {
-      res.json([]);
-      return;
-    }
+    if (!fs.existsSync(CONTEXT_DIR)) { res.json([]); return; }
     const files = fs.readdirSync(CONTEXT_DIR).filter(f => f.endsWith(".json"));
     const tasks: TaskSummary[] = [];
 
     for (const file of files) {
       const match = file.replace(".json", "").match(/^(.+?)_(.+?)_(\d+)$/);
       if (!match) continue;
-
       const [, owner, repo, issueStr] = match;
-      const issueNumber = parseInt(issueStr!, 10);
       const filePath = path.join(CONTEXT_DIR, file);
-
       let messages: Message[] = [];
-      try {
-        messages = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-      } catch { continue; }
-
-      // Get file mtime as last updated
+      try { messages = JSON.parse(fs.readFileSync(filePath, "utf-8")); }
+      catch { continue; }
       const stat = fs.statSync(filePath);
-
       tasks.push({
-        owner: owner!,
-        repo: repo!,
-        issueNumber,
-        messageCount: messages.length,
-        lastUpdated: stat.mtime.toISOString(),
-        status: inferStatus(messages),
-        lastAssistantPreview: getLastAssistantPreview(messages),
+        owner: owner!, repo: repo!, issueNumber: parseInt(issueStr!, 10),
+        messageCount: messages.length, lastUpdated: stat.mtime.toISOString(),
+        status: inferStatus(messages), lastAssistantPreview: getLastAssistantPreview(messages),
       });
     }
-
-    // Sort by last updated descending
-    tasks.sort((a, b) => {
-      if (!a.lastUpdated || !b.lastUpdated) return 0;
-      return new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime();
-    });
-
+    tasks.sort((a, b) => new Date(b.lastUpdated!).getTime() - new Date(a.lastUpdated!).getTime());
     res.json(tasks);
   } catch (e) {
     console.error("[devin] /api/tasks error:", e);
@@ -522,22 +611,12 @@ app.get("/api/tasks/:owner/:repo/:issueNumber", (req, res) => {
   try {
     const { owner, repo, issueNumber } = req.params;
     const filePath = path.join(CONTEXT_DIR, `${owner}_${repo}_${issueNumber}.json`);
-
-    if (!fs.existsSync(filePath)) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-
+    if (!fs.existsSync(filePath)) { res.status(404).json({ error: "Task not found" }); return; }
     const messages: Message[] = JSON.parse(fs.readFileSync(filePath, "utf-8"));
     const stat = fs.statSync(filePath);
-
     res.json({
-      owner,
-      repo,
-      issueNumber: parseInt(issueNumber!, 10),
-      messages,
-      lastUpdated: stat.mtime.toISOString(),
-      status: inferStatus(messages),
+      owner, repo, issueNumber: parseInt(issueNumber!, 10),
+      messages, lastUpdated: stat.mtime.toISOString(), status: inferStatus(messages),
     });
   } catch (e) {
     console.error("[devin] /api/tasks/:id error:", e);
@@ -547,7 +626,12 @@ app.get("/api/tasks/:owner/:repo/:issueNumber", (req, res) => {
 
 app.get("/health", (_req, res) => {
   const contexts = fs.existsSync(CONTEXT_DIR) ? fs.readdirSync(CONTEXT_DIR).length : 0;
-  res.json({ status: "ok", activeContexts: contexts, model: LLM_MODEL });
+  res.json({
+    status: "ok",
+    activeContexts: contexts,
+    activeTasks: Array.from(activeTasks),
+    model: LLM_MODEL,
+  });
 });
 
 app.listen(PORT, () => {
