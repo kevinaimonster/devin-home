@@ -258,12 +258,24 @@ function execAction(action: any, owner: string, repo: string, issueNumber: numbe
 
     case "read_file": {
       const content = ghSafe(`gh api repos/${owner}/${repo}/contents/${action.path}?ref=${action.ref || "main"} --jq .content | base64 -d`);
-      return content ? `Content of ${action.path}:\n${content.slice(0, 4000)}` : `File ${action.path} not found.`;
+      return content ? `Content of ${action.path}:\n${content.slice(0, 8000)}` : `File ${action.path} not found.`;
     }
 
     case "list_files": {
       const tree = ghSafe(`gh api repos/${owner}/${repo}/git/trees/${action.ref || "main"}?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' | head -100`);
       return `Files:\n${tree}`;
+    }
+
+    case "save_memory": {
+      // Append to .devin/memory.md on main branch
+      const memoryPath = ".devin/memory.md";
+      const existing = ghSafe(`gh api repos/${owner}/${repo}/contents/${memoryPath} --jq .content | base64 -d`);
+      const timestamp = new Date().toISOString().split("T")[0];
+      const newContent = existing
+        ? `${existing}\n\n---\n_${timestamp} (Issue #${issueNumber})_\n\n${action.content}`
+        : `# Devin Project Memory\n\n---\n_${timestamp} (Issue #${issueNumber})_\n\n${action.content}`;
+      ghCreateFile(owner, repo, memoryPath, newContent, "main", `Update project memory from #${issueNumber}`);
+      return `Memory saved to ${memoryPath}.`;
     }
 
     default:
@@ -312,6 +324,8 @@ async function handleDevinMention(params: {
       const fileTree = ghSafe(`gh api repos/${owner}/${repo}/git/trees/main?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' | head -100`);
       const projectContext = ghSafe(`gh api repos/${owner}/${repo}/contents/README.md --jq .content | base64 -d`);
       const issueBody = ghSafe(`gh issue view ${issueNumber} --repo ${owner}/${repo} --json body --jq .body`);
+      // Load project memory for cross-issue context
+      const projectMemory = ghSafe(`gh api repos/${owner}/${repo}/contents/.devin/memory.md --jq .content | base64 -d`);
 
       messages = [{
         role: "system",
@@ -323,6 +337,7 @@ Issue #${issueNumber}：${issueTitle}
 文件结构：
 ${fileTree || "(空项目)"}
 ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
+${projectMemory ? `\n项目记忆（来自 .devin/memory.md，包含跨 Issue 的经验和知识）：\n${projectMemory}` : ""}
 
 ## 你可以执行的动作
 
@@ -340,6 +355,7 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 - {"action": "deploy_pages"} — 启用 GitHub Pages 部署（适合静态网页项目）
 - {"action": "read_file", "path": "文件路径", "ref": "分支名"} — 读取仓库中的文件
 - {"action": "list_files", "ref": "分支名"} — 列出仓库文件
+- {"action": "save_memory", "content": "要记住的内容"} — 追加内容到 .devin/memory.md（跨 Issue 持久记忆，记录项目的技术决策、踩过的坑、部署方式等）
 
 ## 输出格式
 
@@ -390,6 +406,12 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       console.log(`[devin] ${key} — iteration ${i + 1}/${MAX_ITERATIONS}`);
+
+      // Auto progress update every 4 iterations
+      if (i > 0 && i % 4 === 0) {
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+        ghComment(owner, repo, issueNumber, `⏳ 进度更新：已完成 ${totalActions} 个操作（${failedActions} 个失败），耗时 ${elapsed}s，当前第 ${i + 1}/${MAX_ITERATIONS} 轮迭代`);
+      }
 
       const response = await chat(messages);
       messages.push({ role: "assistant", content: response });
@@ -457,7 +479,20 @@ ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-    console.log(`[devin] Completed: ${key} (${elapsed}s total)`);
+
+    // Check if we exhausted iterations without completing
+    const lastMsg = messages[messages.length - 1];
+    let didFinish = false;
+    if (lastMsg?.role === "assistant") {
+      try { didFinish = parseJSON(lastMsg.content).done === true; } catch {}
+    }
+    if (!didFinish) {
+      ghComment(owner, repo, issueNumber,
+        `⚠️ 达到最大迭代次数（${MAX_ITERATIONS}轮），任务未完全完成。\n\n已执行 ${totalActions} 个操作（${failedActions} 个失败），耗时 ${elapsed}s。\n\n你可以再次 @devin 让我继续完成剩余工作。`
+      );
+    }
+
+    console.log(`[devin] Completed: ${key} (${elapsed}s total, finished=${didFinish})`);
   } catch (error) {
     console.error(`[devin] Error: ${key}:`, error);
     ghComment(owner, repo, issueNumber,
