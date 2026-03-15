@@ -94,8 +94,17 @@ function ghReaction(owner: string, repo: string, commentId: number, reaction: st
 function ghCreateFile(owner: string, repo: string, filePath: string, content: string, branch: string, message: string) {
   const encoded = Buffer.from(content).toString("base64");
   const sha = ghSafe(`gh api repos/${owner}/${repo}/contents/${filePath}?ref=${branch} --jq .sha`);
-  const shaFlag = sha ? `-f sha="${sha}"` : "";
-  gh(`gh api repos/${owner}/${repo}/contents/${filePath} --method PUT -f message="${message.replace(/"/g, '\\"')}" -f content="${encoded}" -f branch="${branch}" ${shaFlag}`);
+  // Use --input to avoid shell escaping issues with message content
+  const payload: Record<string, string> = { message, content: encoded, branch };
+  if (sha) payload.sha = sha;
+  const tmpFile = path.join(WORKDIR, `.file-${Date.now()}.json`);
+  fs.mkdirSync(WORKDIR, { recursive: true });
+  fs.writeFileSync(tmpFile, JSON.stringify(payload));
+  try {
+    gh(`gh api repos/${owner}/${repo}/contents/${filePath} --method PUT --input ${tmpFile}`);
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
 }
 
 // ---------------------------------------------------------------------------
