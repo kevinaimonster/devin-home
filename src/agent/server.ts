@@ -124,12 +124,16 @@ function validateCode(filePath: string, content: string): string[] {
     issues.push("File is empty");
   }
 
-  // Check for common LLM artifacts
-  if (content.includes("```")) {
-    issues.push("Contains markdown code fences — likely raw LLM output");
-  }
-
   return issues;
+}
+
+/** Strip markdown code fences that LLMs sometimes wrap code in */
+function cleanLLMCode(content: string): string {
+  // Remove wrapping ```lang\n...\n```
+  const match = content.match(/^```(?:\w+)?\s*\n([\s\S]*?)\n```\s*$/);
+  if (match) return match[1]!;
+  // Remove leading/trailing ``` without language
+  return content.replace(/^```\s*\n?/, "").replace(/\n?```\s*$/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -171,21 +175,21 @@ function execAction(action: any, owner: string, repo: string, issueNumber: numbe
     }
 
     case "commit_file": {
-      // Validate code before committing
-      const issues = validateCode(action.path, action.content);
+      const cleaned = cleanLLMCode(action.content);
+      const issues = validateCode(action.path, cleaned);
       if (issues.length > 0) {
         return `Validation failed for ${action.path}: ${issues.join("; ")}. Fix the code and retry.`;
       }
-      ghCreateFile(owner, repo, action.path, action.content, action.branch, action.message || `Update ${action.path}`);
+      ghCreateFile(owner, repo, action.path, cleaned, action.branch, action.message || `Update ${action.path}`);
       return `Committed ${action.path} to ${action.branch}.`;
     }
 
     case "commit_files": {
-      // Atomic multi-file commit via Git Tree API
       const branch: string = action.branch;
-      const files: Array<{ path: string; content: string }> = action.files;
+      const files: Array<{ path: string; content: string }> = action.files.map(
+        (f: any) => ({ path: f.path, content: cleanLLMCode(f.content) })
+      );
 
-      // Validate all files first
       const allIssues: string[] = [];
       for (const f of files) {
         const issues = validateCode(f.path, f.content);
@@ -465,7 +469,10 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
 - 一轮迭代中尽量批量执行多个 actions
 - review_pr 后如果代码没问题，立即在同一轮 merge + close
 - 不要反复 read_file 同一个文件
-- 如果某个 action 失败了，分析原因后重试或换一种方式`,
+- 如果某个 action 失败了，分析原因后重试或换一种方式
+- 修改已有文件时：必须先 read_file 读取当前内容，理解后再生成完整的新版本。不要凭记忆修改
+- 生成代码时注意：不要在 content 中包含 markdown 代码块标记（系统会自动清理，但最好从源头避免）
+- 写代码时遵循项目已有的代码风格（从技术栈信息和文件内容推断）`,
       }, {
         role: "user",
         content: `Issue 标题：${issueTitle}\nIssue 内容：${issueBody}\n\n用户请求：${request}`,
@@ -568,6 +575,27 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
       ghComment(owner, repo, issueNumber,
         `⚠️ 达到最大迭代次数（${MAX_ITERATIONS}轮），任务未完全完成。\n\n已执行 ${totalActions} 个操作（${failedActions} 个失败），耗时 ${elapsed}s。\n\n你可以再次 @devin 让我继续完成剩余工作。`
       );
+    } else {
+      // Auto-generate structured completion report
+      const actionLog = messages
+        .filter(m => m.role === "user" && m.content.startsWith("Action results:"))
+        .flatMap(m => m.content.split("\n").filter(l => l.startsWith("✓") || l.startsWith("✗")))
+        .slice(-15);
+
+      const report = [
+        `## 🤖 任务完成`,
+        ``,
+        `| 指标 | 值 |`,
+        `|------|-----|`,
+        `| 耗时 | ${elapsed}s |`,
+        `| 总操作 | ${totalActions} |`,
+        `| 失败 | ${failedActions} |`,
+        `| 迭代轮数 | ${messages.filter(m => m.role === "assistant").length} |`,
+        ``,
+        actionLog.length > 0 ? `### 操作记录\n${actionLog.map(l => `- ${l}`).join("\n")}` : "",
+      ].filter(Boolean).join("\n");
+
+      ghComment(owner, repo, issueNumber, report);
     }
 
     console.log(`[devin] Completed: ${key} (${elapsed}s total, finished=${didFinish})`);
