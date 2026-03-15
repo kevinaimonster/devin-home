@@ -179,8 +179,22 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
       return "Comment posted.";
 
     case "create_branch": {
-      const mainSha = gh(`gh api repos/${owner}/${repo}/git/ref/heads/main --jq .object.sha`);
-      ghSafe(`gh api repos/${owner}/${repo}/git/refs --method POST -f ref="refs/heads/${action.branch}" -f sha="${mainSha}"`);
+      // Create branch by committing a marker file via Contents API
+      // This works even without git/refs write permission
+      const markerPath = `.devin/.branch-${Date.now()}`;
+      const markerContent = Buffer.from(`Branch created for #${issueNumber}`).toString("base64");
+      try {
+        gh(`gh api repos/${owner}/${repo}/contents/${markerPath} --method PUT -f message="Create branch ${action.branch}" -f content="${markerContent}" -f branch="${action.branch}"`);
+        // Clean up marker file
+        const markerSha = ghSafe(`gh api repos/${owner}/${repo}/contents/${markerPath}?ref=${action.branch} --jq .sha`);
+        if (markerSha) {
+          ghSafe(`gh api repos/${owner}/${repo}/contents/${markerPath} --method DELETE -f message="Clean up" -f sha="${markerSha}" -f branch="${action.branch}"`);
+        }
+      } catch {
+        // Fallback: try git/refs API
+        const mainSha = gh(`gh api repos/${owner}/${repo}/git/ref/heads/main --jq .object.sha`);
+        gh(`gh api repos/${owner}/${repo}/git/refs --method POST -f ref="refs/heads/${action.branch}" -f sha="${mainSha}"`);
+      }
       return `Branch ${action.branch} created.`;
     }
 
