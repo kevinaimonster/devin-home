@@ -209,37 +209,18 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
         return `Validation failed:\n${allIssues.join("\n")}\nFix the code and retry.`;
       }
 
-      // Get base tree — use matching-refs endpoint to handle branch names with slashes
-      const baseSha = gh(`gh api repos/${owner}/${repo}/git/matching-refs/heads/${branch} --jq '.[0].object.sha'`);
-      const baseTreeSha = gh(`gh api repos/${owner}/${repo}/git/commits/${baseSha} --jq .tree.sha`);
-
-      // Create blobs and build tree entries
-      const treeEntries: string[] = [];
+      // Fallback approach: commit files one by one via Contents API (more reliable than Git Tree API)
+      const committed: string[] = [];
       for (const f of files) {
-        const encoded = Buffer.from(f.content).toString("base64");
-        const blobSha = gh(`gh api repos/${owner}/${repo}/git/blobs --method POST -f content="${encoded}" -f encoding="base64" --jq .sha`);
-        treeEntries.push(`{"path":"${f.path}","mode":"100644","type":"blob","sha":"${blobSha}"}`);
+        try {
+          ghCreateFile(owner, repo, f.path, f.content, branch, action.message || `Update ${f.path}\n\nPart of #${issueNumber}`);
+          committed.push(f.path);
+        } catch (e) {
+          return `Failed at ${f.path} (${committed.length}/${files.length} committed): ${e instanceof Error ? e.message : e}`;
+        }
       }
 
-      // Create tree
-      const treeJson = `[${treeEntries.join(",")}]`;
-      const tmpTreeFile = path.join(WORKDIR, `.tree-${Date.now()}.json`);
-      fs.writeFileSync(tmpTreeFile, JSON.stringify({ base_tree: baseTreeSha, tree: JSON.parse(treeJson) }));
-      const newTreeSha = gh(`gh api repos/${owner}/${repo}/git/trees --method POST --input ${tmpTreeFile} --jq .sha`);
-      fs.unlinkSync(tmpTreeFile);
-
-      // Create commit
-      const message = action.message || `Add ${files.length} files\n\nPart of #${issueNumber}`;
-      const tmpCommitFile = path.join(WORKDIR, `.commit-${Date.now()}.json`);
-      fs.writeFileSync(tmpCommitFile, JSON.stringify({ message, tree: newTreeSha, parents: [baseSha] }));
-      const newCommitSha = gh(`gh api repos/${owner}/${repo}/git/commits --method POST --input ${tmpCommitFile} --jq .sha`);
-      fs.unlinkSync(tmpCommitFile);
-
-      // Update branch ref — use matching-refs to handle branch names with slashes
-      const refSha = gh(`gh api repos/${owner}/${repo}/git/matching-refs/heads/${branch} --jq '.[0].ref'`);
-      gh(`gh api repos/${owner}/${repo}/git/${refSha} --method PATCH -f sha="${newCommitSha}"`);
-
-      return `Atomically committed ${files.length} files to ${branch}: ${files.map(f => f.path).join(", ")}`;
+      return `Committed ${files.length} files to ${branch}: ${committed.join(", ")}`;
     }
 
     case "create_pr": {
