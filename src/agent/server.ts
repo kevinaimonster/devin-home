@@ -75,11 +75,13 @@ function ghSafe(cmd: string, timeout = 30000): string {
   catch { return ""; }
 }
 
+const DEVIN_SIGNATURE = "\n\n---\n<sub>🤖 *This comment was posted by Devin, an AI agent. Not a human.*</sub>";
+
 function ghComment(owner: string, repo: string, issueNumber: number, body: string) {
   try {
     const tmpFile = path.join(WORKDIR, `.comment-${Date.now()}.md`);
     fs.mkdirSync(WORKDIR, { recursive: true });
-    fs.writeFileSync(tmpFile, body);
+    fs.writeFileSync(tmpFile, body + DEVIN_SIGNATURE);
     gh(`gh issue comment ${issueNumber} --repo ${owner}/${repo} --body-file ${tmpFile}`);
     fs.unlinkSync(tmpFile);
   } catch (e) {
@@ -770,7 +772,7 @@ app.post("/webhook", async (req, res) => {
     const commenter = event.comment?.user?.login ?? "";
     if (commenter.includes("[bot]")) return;
     if (commenter === "github-actions") return;
-    if (body.startsWith("🤖") || body.startsWith("## 📋") || body.startsWith("## ✅") || body.includes("正在处理中") || body.includes("正在分析需求")) return;
+    if (body.startsWith("🤖") || body.startsWith("## 📋") || body.startsWith("## ✅") || body.includes("正在处理中") || body.includes("正在分析需求") || body.includes("posted by Devin, an AI agent")) return;
 
     enqueueTask({
       owner: event.repository.owner.login,
