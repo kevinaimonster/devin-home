@@ -170,11 +170,25 @@ async function chat(messages: Message[]): Promise<string> {
 }
 
 function parseJSON(text: string): any {
+  // Try direct parse first
+  try { return JSON.parse(text.trim()); } catch {}
+  // Try extracting from markdown code block
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  let cleaned = jsonMatch ? jsonMatch[1]!.trim() : text.trim();
-  const braceMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (braceMatch) cleaned = braceMatch[0];
-  return JSON.parse(cleaned);
+  if (jsonMatch) {
+    try { return JSON.parse(jsonMatch[1]!.trim()); } catch {}
+  }
+  // Try finding outermost braces
+  const braceMatch = text.match(/\{[\s\S]*\}/);
+  if (braceMatch) {
+    try { return JSON.parse(braceMatch[0]); } catch {}
+  }
+  // Last resort: try fixing common issues (trailing commas, unescaped newlines in strings)
+  const cleaned = text.replace(/,\s*([\]}])/g, "$1");
+  const braceMatch2 = cleaned.match(/\{[\s\S]*\}/);
+  if (braceMatch2) {
+    return JSON.parse(braceMatch2[0]);
+  }
+  throw new Error("Could not parse JSON from response");
 }
 
 // ---------------------------------------------------------------------------
@@ -456,26 +470,25 @@ function collectProjectContext(owner: string, repo: string): string {
 // ---------------------------------------------------------------------------
 
 async function compactContext(messages: Message[]): Promise<Message[]> {
-  // Only compact if we have more than 12 messages (system + 5+ rounds)
-  if (messages.length <= 12) return messages;
+  // Only compact if we have more than 14 messages
+  if (messages.length <= 14) return messages;
 
-  // Keep system prompt (first message) and last 6 messages
+  // Keep system prompt and last 8 messages (more context = fewer mistakes)
   const systemMsg = messages[0];
-  const recentMessages = messages.slice(-6);
-  const oldMessages = messages.slice(1, -6);
+  const recentMessages = messages.slice(-8);
+  const oldMessages = messages.slice(1, -8);
 
-  // Summarize old messages
   const summary = await chat([
-    { role: "system", content: "Summarize the following conversation history into a concise summary. Focus on: what actions were taken, what files were created/modified, what PRs were created (include numbers), what's the current state. Output plain text, max 500 words." },
-    { role: "user", content: oldMessages.map(m => `[${m.role}]: ${m.content.slice(0, 500)}`).join("\n\n") },
+    { role: "system", content: "Summarize the following conversation into a concise summary. Focus on: what was successfully done (files created, PRs created with numbers, merges). Ignore failed attempts and errors — only summarize successes. Output plain text, max 300 words." },
+    { role: "user", content: oldMessages.map(m => `[${m.role}]: ${m.content.slice(0, 400)}`).join("\n\n") },
   ]);
 
-  console.log(`[devin] Context compacted: ${messages.length} → ${8} messages`);
+  console.log(`[devin] Context compacted: ${messages.length} → ${10} messages`);
 
   return [
     systemMsg,
-    { role: "user", content: `[Context Summary — previous ${oldMessages.length} messages compacted]\n\n${summary}` },
-    { role: "assistant", content: '{"actions": [], "thinking": "Understood the context summary. Ready to continue.", "done": false}' },
+    { role: "user", content: `[Previous work summary]\n\n${summary}` },
+    { role: "assistant", content: '{"actions": [], "thinking": "Understood. Ready to continue.", "done": false}' },
     ...recentMessages,
   ];
 }
