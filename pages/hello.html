@@ -92,9 +92,16 @@
     </div>
 
     <script>
+        // Update current time display
         function updateTime() {
             const now = new Date();
-            const timeElement = document.getElementById('current-time');
+            const currentTimeElement = document.getElementById('current-time');
+            
+            // Check if element exists
+            if (!currentTimeElement) {
+                console.error('Time display element not found');
+                return;
+            }
             
             // Format the time: Day, Month Date, Year HH:MM:SS
             const options = { 
@@ -109,12 +116,33 @@
             };
             
             const formattedTime = now.toLocaleDateString('en-US', options);
-            timeElement.textContent = formattedTime;
+            // Use textContent for XSS safety (though formattedTime is safe in this context)
+            currentTimeElement.textContent = formattedTime;
         }
         
-        // Update time immediately and then every second
-        updateTime();
-        setInterval(updateTime, 1000);
+        // Initialize time update
+        let timeUpdateInterval = null;
+        
+        function startTimeUpdates() {
+            // Update time immediately
+            updateTime();
+            
+            // Start interval for updates every second
+            if (timeUpdateInterval) {
+                clearInterval(timeUpdateInterval);
+            }
+            timeUpdateInterval = setInterval(updateTime, 1000);
+        }
+        
+        function stopTimeUpdates() {
+            if (timeUpdateInterval) {
+                clearInterval(timeUpdateInterval);
+                timeUpdateInterval = null;
+            }
+        }
+        
+        // Start time updates when page loads
+        document.addEventListener('DOMContentLoaded', startTimeUpdates);
         
         // Also update when page becomes visible again (if user switches tabs)
         document.addEventListener('visibilitychange', function() {
@@ -122,6 +150,9 @@
                 updateTime();
             }
         });
+        
+        // Clean up interval when page is unloaded (optional, for completeness)
+        window.addEventListener('beforeunload', stopTimeUpdates);
     </script>
 </body>
 </html>
