@@ -4,6 +4,8 @@
  * Webhook server that receives GitHub @devin mentions. Devin autonomously
  * decides the full workflow: analyze → implement → PR → review → merge → deploy.
  *
+ * Uses GitHub App Installation Token + REST API (no gh CLI dependency).
+ *
  * Run: npx tsx src/agent/server.ts
  */
 
@@ -11,7 +13,6 @@ import express from "express";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
 import OpenAI from "openai";
 
 // ---------------------------------------------------------------------------
@@ -27,7 +28,96 @@ const LLM_BASE_URL = process.env.LLM_BASE_URL ?? "https://api.deepseek.com";
 const LLM_API_KEY = process.env.LLM_API_KEY!;
 const LLM_MODEL = process.env.LLM_MODEL ?? "deepseek-chat";
 
+const GITHUB_APP_ID = process.env.GITHUB_APP_ID!;
+const GITHUB_APP_PRIVATE_KEY = (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n");
+
+const ALLOWED_ACCOUNTS = (process.env.ALLOWED_ACCOUNTS ?? "")
+  .split(",")
+  .map(a => a.trim().toLowerCase())
+  .filter(Boolean);
+
 const openai = new OpenAI({ baseURL: LLM_BASE_URL, apiKey: LLM_API_KEY });
+
+// ---------------------------------------------------------------------------
+// GitHub App Authentication
+// ---------------------------------------------------------------------------
+
+function generateJWT(): string {
+  const now = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    iat: now - 60,
+    exp: now + 600,
+    iss: GITHUB_APP_ID,
+  })).toString("base64url");
+  const signing = crypto.createSign("RSA-SHA256");
+  signing.update(`${header}.${payload}`);
+  const signature = signing.sign(GITHUB_APP_PRIVATE_KEY, "base64url");
+  return `${header}.${payload}.${signature}`;
+}
+
+const tokenCache = new Map<number, { token: string; expiresAt: number }>();
+
+async function getInstallationToken(installationId: number): Promise<string> {
+  const cached = tokenCache.get(installationId);
+  if (cached && cached.expiresAt > Date.now() + 5 * 60 * 1000) {
+    return cached.token;
+  }
+  const jwt = generateJWT();
+  const res = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json" },
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Failed to get installation token: ${res.status} ${err}`);
+  }
+  const data = await res.json() as { token: string; expires_at: string };
+  tokenCache.set(installationId, {
+    token: data.token,
+    expiresAt: new Date(data.expires_at).getTime(),
+  });
+  return data.token;
+}
+
+async function githubApi(
+  installationId: number,
+  method: string,
+  endpoint: string,
+  body?: any
+): Promise<any> {
+  const token = await getInstallationToken(installationId);
+  const res = await fetch(`https://api.github.com${endpoint}`, {
+    method,
+    headers: {
+      Authorization: `token ${token}`,
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`GitHub API ${method} ${endpoint}: ${res.status} ${err}`);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+/** Like githubApi but returns null instead of throwing on error */
+async function githubApiSafe(
+  installationId: number,
+  method: string,
+  endpoint: string,
+  body?: any
+): Promise<any> {
+  try {
+    return await githubApi(installationId, method, endpoint, body);
+  } catch (e) {
+    console.error(`[devin] githubApiSafe failed: ${method} ${endpoint}`, e instanceof Error ? e.message : e);
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Context persistence
@@ -50,7 +140,7 @@ function saveContext(owner: string, repo: string, issueNumber: number, messages:
 }
 
 // ---------------------------------------------------------------------------
-// GitHub helpers (gh CLI)
+// GitHub helpers
 // ---------------------------------------------------------------------------
 
 function verifySignature(payload: string, signature: string): boolean {
@@ -60,53 +150,35 @@ function verifySignature(payload: string, signature: string): boolean {
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
 
-function gh(cmd: string, timeout = 30000): string {
-  try {
-    return execSync(cmd, { stdio: "pipe", timeout }).toString().trim();
-  } catch (e: any) {
-    const stderr = e.stderr?.toString() ?? "";
-    console.error(`[devin] gh failed: ${cmd}\n${stderr}`);
-    throw e;
-  }
-}
-
-function ghSafe(cmd: string, timeout = 30000): string {
-  try { return gh(cmd, timeout); }
-  catch { return ""; }
-}
-
 const DEVIN_SIGNATURE = "\n\n---\n<sub>🤖 *This comment was posted by Devin, an AI agent. Not a human.*</sub>";
 
-function ghComment(owner: string, repo: string, issueNumber: number, body: string) {
+async function ghComment(installationId: number, owner: string, repo: string, issueNumber: number, body: string) {
   try {
-    const tmpFile = path.join(WORKDIR, `.comment-${Date.now()}.md`);
-    fs.mkdirSync(WORKDIR, { recursive: true });
-    fs.writeFileSync(tmpFile, body + DEVIN_SIGNATURE);
-    gh(`gh issue comment ${issueNumber} --repo ${owner}/${repo} --body-file ${tmpFile}`);
-    fs.unlinkSync(tmpFile);
+    await githubApi(installationId, "POST", `/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
+      body: body + DEVIN_SIGNATURE,
+    });
   } catch (e) {
     console.error(`[devin] Failed to comment:`, e instanceof Error ? e.message : e);
   }
 }
 
-function ghReaction(owner: string, repo: string, commentId: number, reaction: string) {
-  ghSafe(`gh api repos/${owner}/${repo}/issues/comments/${commentId}/reactions --method POST -f content="${reaction}"`);
+async function ghReaction(installationId: number, owner: string, repo: string, commentId: number, reaction: string) {
+  await githubApiSafe(installationId, "POST", `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`, {
+    content: reaction,
+  });
 }
 
-function ghCreateFile(owner: string, repo: string, filePath: string, content: string, branch: string, message: string) {
+async function ghCreateFile(installationId: number, owner: string, repo: string, filePath: string, content: string, branch: string, message: string) {
   const encoded = Buffer.from(content).toString("base64");
-  const sha = ghSafe(`gh api repos/${owner}/${repo}/contents/${filePath}?ref=${branch} --jq .sha`);
-  // Use --input to avoid shell escaping issues with message content
+  // Try to get existing file SHA
+  let sha: string | undefined;
+  const existing = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/${filePath}?ref=${branch}`);
+  if (existing && existing.sha) {
+    sha = existing.sha;
+  }
   const payload: Record<string, string> = { message, content: encoded, branch };
   if (sha) payload.sha = sha;
-  const tmpFile = path.join(WORKDIR, `.file-${Date.now()}.json`);
-  fs.mkdirSync(WORKDIR, { recursive: true });
-  fs.writeFileSync(tmpFile, JSON.stringify(payload));
-  try {
-    gh(`gh api repos/${owner}/${repo}/contents/${filePath} --method PUT --input ${tmpFile}`);
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch {}
-  }
+  await githubApi(installationId, "PUT", `/repos/${owner}/${repo}/contents/${filePath}`, payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,28 +269,39 @@ function parseJSON(text: string): any {
 // Actions
 // ---------------------------------------------------------------------------
 
-async function execAction(action: any, owner: string, repo: string, issueNumber: number): Promise<string> {
+async function execAction(action: any, installationId: number, owner: string, repo: string, issueNumber: number): Promise<string> {
   switch (action.action) {
     case "comment":
-      ghComment(owner, repo, issueNumber, action.body);
+      await ghComment(installationId, owner, repo, issueNumber, action.body);
       return "Comment posted.";
 
     case "create_branch": {
       // Create branch by committing a marker file via Contents API
-      // This works even without git/refs write permission
       const markerPath = `.devin/.branch-${Date.now()}`;
       const markerContent = Buffer.from(`Branch created for #${issueNumber}`).toString("base64");
       try {
-        gh(`gh api repos/${owner}/${repo}/contents/${markerPath} --method PUT -f message="Create branch ${action.branch}" -f content="${markerContent}" -f branch="${action.branch}"`);
+        await githubApi(installationId, "PUT", `/repos/${owner}/${repo}/contents/${markerPath}`, {
+          message: `Create branch ${action.branch}`,
+          content: markerContent,
+          branch: action.branch,
+        });
         // Clean up marker file
-        const markerSha = ghSafe(`gh api repos/${owner}/${repo}/contents/${markerPath}?ref=${action.branch} --jq .sha`);
-        if (markerSha) {
-          ghSafe(`gh api repos/${owner}/${repo}/contents/${markerPath} --method DELETE -f message="Clean up" -f sha="${markerSha}" -f branch="${action.branch}"`);
+        const markerData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/${markerPath}?ref=${action.branch}`);
+        if (markerData && markerData.sha) {
+          await githubApiSafe(installationId, "DELETE", `/repos/${owner}/${repo}/contents/${markerPath}`, {
+            message: "Clean up",
+            sha: markerData.sha,
+            branch: action.branch,
+          });
         }
       } catch {
         // Fallback: try git/refs API
-        const mainSha = gh(`gh api repos/${owner}/${repo}/git/ref/heads/main --jq .object.sha`);
-        gh(`gh api repos/${owner}/${repo}/git/refs --method POST -f ref="refs/heads/${action.branch}" -f sha="${mainSha}"`);
+        const refData = await githubApi(installationId, "GET", `/repos/${owner}/${repo}/git/ref/heads/main`);
+        const mainSha = refData.object.sha;
+        await githubApi(installationId, "POST", `/repos/${owner}/${repo}/git/refs`, {
+          ref: `refs/heads/${action.branch}`,
+          sha: mainSha,
+        });
       }
       return `Branch ${action.branch} created.`;
     }
@@ -229,7 +312,7 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
       if (issues.length > 0) {
         return `Validation failed for ${action.path}: ${issues.join("; ")}. Fix the code and retry.`;
       }
-      ghCreateFile(owner, repo, action.path, cleaned, action.branch, action.message || `Update ${action.path}`);
+      await ghCreateFile(installationId, owner, repo, action.path, cleaned, action.branch, action.message || `Update ${action.path}`);
       return `Committed ${action.path} to ${action.branch}.`;
     }
 
@@ -248,11 +331,11 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
         return `Validation failed:\n${allIssues.join("\n")}\nFix the code and retry.`;
       }
 
-      // Fallback approach: commit files one by one via Contents API (more reliable than Git Tree API)
+      // Commit files one by one via Contents API
       const committed: string[] = [];
       for (const f of files) {
         try {
-          ghCreateFile(owner, repo, f.path, f.content, branch, action.message || `Update ${f.path}\n\nPart of #${issueNumber}`);
+          await ghCreateFile(installationId, owner, repo, f.path, f.content, branch, action.message || `Update ${f.path}\n\nPart of #${issueNumber}`);
           committed.push(f.path);
         } catch (e) {
           return `Failed at ${f.path} (${committed.length}/${files.length} committed): ${e instanceof Error ? e.message : e}`;
@@ -263,16 +346,29 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
     }
 
     case "create_pr": {
-      const tmpFile = path.join(WORKDIR, `.pr-body-${Date.now()}.md`);
-      fs.writeFileSync(tmpFile, action.body || "");
-      const url = gh(`gh pr create --repo ${owner}/${repo} --head ${action.branch} --base main --title "${(action.title || "").replace(/"/g, '\\"')}" --body-file ${tmpFile}`);
-      fs.unlinkSync(tmpFile);
-      return `PR created: ${url}`;
+      const result = await githubApi(installationId, "POST", `/repos/${owner}/${repo}/pulls`, {
+        head: action.branch,
+        base: "main",
+        title: action.title || "",
+        body: action.body || "",
+      });
+      return `PR created: ${result.html_url}`;
     }
 
     case "review_pr": {
-      const diff = ghSafe(`gh pr diff ${action.pr_number} --repo ${owner}/${repo}`);
+      const filesData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/pulls/${action.pr_number}/files`);
+      if (!filesData || filesData.length === 0) return `PR #${action.pr_number}: no diff found.`;
+
+      // Build diff text from files data
+      const diffParts: string[] = [];
+      for (const file of filesData) {
+        if (file.patch) {
+          diffParts.push(`--- ${file.filename}\n${file.patch}`);
+        }
+      }
+      const diff = diffParts.join("\n\n");
       if (!diff) return `PR #${action.pr_number}: no diff found.`;
+
       // Use LLM to do a structured code review
       const reviewPrompt: Message[] = [
         { role: "system", content: `你是一个代码审查专家。审查以下 PR diff，检查：
@@ -291,40 +387,70 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
     }
 
     case "merge_pr": {
-      gh(`gh pr merge ${action.pr_number} --repo ${owner}/${repo} --squash --delete-branch`);
+      await githubApi(installationId, "PUT", `/repos/${owner}/${repo}/pulls/${action.pr_number}/merge`, {
+        merge_method: "squash",
+      });
+      // Delete the branch after merge
+      try {
+        const prData = await githubApi(installationId, "GET", `/repos/${owner}/${repo}/pulls/${action.pr_number}`);
+        if (prData && prData.head && prData.head.ref) {
+          await githubApiSafe(installationId, "DELETE", `/repos/${owner}/${repo}/git/refs/heads/${prData.head.ref}`);
+        }
+      } catch {}
       return `PR #${action.pr_number} merged and branch deleted.`;
     }
 
     case "close_issue": {
-      gh(`gh issue close ${issueNumber} --repo ${owner}/${repo} --reason completed`);
+      await githubApi(installationId, "PATCH", `/repos/${owner}/${repo}/issues/${issueNumber}`, {
+        state: "closed",
+        state_reason: "completed",
+      });
       return `Issue #${issueNumber} closed.`;
     }
 
     case "deploy_pages": {
-      ghSafe(`gh api repos/${owner}/${repo}/pages --method POST -f source='{"branch":"main","path":"/"}' 2>/dev/null`);
-      const pagesUrl = ghSafe(`gh api repos/${owner}/${repo}/pages --jq .html_url`);
+      await githubApiSafe(installationId, "POST", `/repos/${owner}/${repo}/pages`, {
+        source: { branch: "main", path: "/" },
+      });
+      const pagesData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/pages`);
+      const pagesUrl = pagesData?.html_url;
       return pagesUrl ? `GitHub Pages deployed: ${pagesUrl}` : "GitHub Pages deployment initiated.";
     }
 
     case "read_file": {
-      const content = ghSafe(`gh api repos/${owner}/${repo}/contents/${action.path}?ref=${action.ref || "main"} --jq .content | base64 -d`);
-      return content ? `Content of ${action.path}:\n${content.slice(0, 8000)}` : `File ${action.path} not found.`;
+      const data = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/${action.path}?ref=${action.ref || "main"}`);
+      if (data && data.content) {
+        const content = Buffer.from(data.content, "base64").toString("utf-8");
+        return `Content of ${action.path}:\n${content.slice(0, 8000)}`;
+      }
+      return `File ${action.path} not found.`;
     }
 
     case "list_files": {
-      const tree = ghSafe(`gh api repos/${owner}/${repo}/git/trees/${action.ref || "main"}?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' | head -100`);
-      return `Files:\n${tree}`;
+      const treeData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/git/trees/${action.ref || "main"}?recursive=1`);
+      if (treeData && treeData.tree) {
+        const files = treeData.tree
+          .filter((item: any) => item.type === "blob")
+          .map((item: any) => item.path)
+          .slice(0, 100);
+        return `Files:\n${files.join("\n")}`;
+      }
+      return "Files: (empty or not found)";
     }
 
     case "save_memory": {
       // Append to .devin/memory.md on main branch
       const memoryPath = ".devin/memory.md";
-      const existing = ghSafe(`gh api repos/${owner}/${repo}/contents/${memoryPath} --jq .content | base64 -d`);
+      const existingData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/${memoryPath}`);
+      let existing = "";
+      if (existingData && existingData.content) {
+        existing = Buffer.from(existingData.content, "base64").toString("utf-8");
+      }
       const timestamp = new Date().toISOString().split("T")[0];
       const newContent = existing
         ? `${existing}\n\n---\n_${timestamp} (Issue #${issueNumber})_\n\n${action.content}`
         : `# Devin Project Memory\n\n---\n_${timestamp} (Issue #${issueNumber})_\n\n${action.content}`;
-      ghCreateFile(owner, repo, memoryPath, newContent, "main", `Update project memory from #${issueNumber}`);
+      await ghCreateFile(installationId, owner, repo, memoryPath, newContent, "main", `Update project memory from #${issueNumber}`);
       return `Memory saved to ${memoryPath}.`;
     }
 
@@ -338,6 +464,7 @@ async function execAction(action: any, owner: string, repo: string, issueNumber:
 // ---------------------------------------------------------------------------
 
 interface QueuedTask {
+  installationId: number;
   owner: string;
   repo: string;
   issueNumber: number;
@@ -355,7 +482,7 @@ const RATE_LIMIT_MS = 60_000; // 60 seconds cooldown per issue
 function enqueueTask(task: QueuedTask) {
   // Handle --help
   if (task.request.trim() === "--help" || task.request.trim() === "help") {
-    ghComment(task.owner, task.repo, task.issueNumber, HELP_TEXT);
+    ghComment(task.installationId, task.owner, task.repo, task.issueNumber, HELP_TEXT);
     return;
   }
 
@@ -441,13 +568,14 @@ function parseDirectives(raw: string): UserDirectives {
 // Smart context collection
 // ---------------------------------------------------------------------------
 
-function collectProjectContext(owner: string, repo: string): string {
+async function collectProjectContext(installationId: number, owner: string, repo: string): Promise<string> {
   const parts: string[] = [];
 
   // package.json — framework, dependencies
-  const pkgJson = ghSafe(`gh api repos/${owner}/${repo}/contents/package.json --jq .content | base64 -d`);
-  if (pkgJson) {
+  const pkgData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/package.json`);
+  if (pkgData && pkgData.content) {
     try {
+      const pkgJson = Buffer.from(pkgData.content, "base64").toString("utf-8");
       const pkg = JSON.parse(pkgJson);
       const deps = { ...pkg.dependencies, ...pkg.devDependencies };
       const depNames = Object.keys(deps).slice(0, 30).join(", ");
@@ -457,12 +585,15 @@ function collectProjectContext(owner: string, repo: string): string {
   }
 
   // tsconfig.json — TypeScript config
-  const tsconfig = ghSafe(`gh api repos/${owner}/${repo}/contents/tsconfig.json --jq .content | base64 -d`);
-  if (tsconfig) parts.push("TypeScript project detected.");
+  const tsData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/tsconfig.json`);
+  if (tsData && tsData.content) parts.push("TypeScript project detected.");
 
   // .devin/config.yml — custom Devin config (future)
-  const devinConfig = ghSafe(`gh api repos/${owner}/${repo}/contents/.devin/config.yml --jq .content | base64 -d`);
-  if (devinConfig) parts.push(`Devin config:\n${devinConfig}`);
+  const devinData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/.devin/config.yml`);
+  if (devinData && devinData.content) {
+    const devinConfig = Buffer.from(devinData.content, "base64").toString("utf-8");
+    parts.push(`Devin config:\n${devinConfig}`);
+  }
 
   return parts.join("\n");
 }
@@ -500,7 +631,7 @@ async function compactContext(messages: Message[]): Promise<Message[]> {
 // ---------------------------------------------------------------------------
 
 async function handleDevinMention(task: QueuedTask) {
-  const { owner, repo, issueNumber, issueTitle, isPR, commentId } = task;
+  const { installationId, owner, repo, issueNumber, issueTitle, isPR, commentId } = task;
   const directives = parseDirectives(task.request);
   const request = directives.request;
   const key = `${owner}/${repo}#${issueNumber}`;
@@ -511,18 +642,43 @@ async function handleDevinMention(task: QueuedTask) {
   console.log(`[devin] Processing: ${key}${directives.noMerge ? " (no-merge)" : ""}${directives.draft ? " (draft)" : ""}`);
 
   if (commentId) {
-    ghReaction(owner, repo, commentId, "rocket");
+    await ghReaction(installationId, owner, repo, commentId, "rocket");
   }
 
   try {
     let messages = loadContext(owner, repo, issueNumber);
 
     if (messages.length === 0) {
-      const fileTree = ghSafe(`gh api repos/${owner}/${repo}/git/trees/main?recursive=1 --jq '.tree[] | select(.type=="blob") | .path' | head -100`);
-      const projectContext = ghSafe(`gh api repos/${owner}/${repo}/contents/README.md --jq .content | base64 -d`);
-      const issueBody = ghSafe(`gh issue view ${issueNumber} --repo ${owner}/${repo} --json body --jq .body`);
-      const projectMemory = ghSafe(`gh api repos/${owner}/${repo}/contents/.devin/memory.md --jq .content | base64 -d`);
-      const techContext = collectProjectContext(owner, repo);
+      // Get file tree
+      const treeData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/git/trees/main?recursive=1`);
+      let fileTree = "(空项目)";
+      if (treeData && treeData.tree) {
+        fileTree = treeData.tree
+          .filter((item: any) => item.type === "blob")
+          .map((item: any) => item.path)
+          .slice(0, 100)
+          .join("\n");
+      }
+
+      // Get README
+      const readmeData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/README.md`);
+      let projectContext = "";
+      if (readmeData && readmeData.content) {
+        projectContext = Buffer.from(readmeData.content, "base64").toString("utf-8");
+      }
+
+      // Get issue body
+      const issueData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/issues/${issueNumber}`);
+      const issueBody = issueData?.body ?? "";
+
+      // Get project memory
+      const memoryData = await githubApiSafe(installationId, "GET", `/repos/${owner}/${repo}/contents/.devin/memory.md`);
+      let projectMemory = "";
+      if (memoryData && memoryData.content) {
+        projectMemory = Buffer.from(memoryData.content, "base64").toString("utf-8");
+      }
+
+      const techContext = await collectProjectContext(installationId, owner, repo);
 
       messages = [{
         role: "system",
@@ -619,7 +775,7 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
       // Auto progress update every 4 iterations
       if (i > 0 && i % 4 === 0) {
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-        ghComment(owner, repo, issueNumber, `⏳ 进度更新：已完成 ${totalActions} 个操作（${failedActions} 个失败），耗时 ${elapsed}s，当前第 ${i + 1}/${MAX_ITERATIONS} 轮迭代`);
+        await ghComment(installationId, owner, repo, issueNumber, `⏳ 进度更新：已完成 ${totalActions} 个操作（${failedActions} 个失败），耗时 ${elapsed}s，当前第 ${i + 1}/${MAX_ITERATIONS} 轮迭代`);
       }
 
       // Compact context if conversation is getting long
@@ -653,7 +809,7 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
 
         try {
           console.log(`[devin] Executing: ${actionLabel}`);
-          const result = await execAction(action, owner, repo, issueNumber);
+          const result = await execAction(action, installationId, owner, repo, issueNumber);
 
           // Check if validation failed (returned as result, not thrown)
           if (result.startsWith("Validation failed")) {
@@ -699,7 +855,7 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
       try { didFinish = parseJSON(lastMsg.content).done === true; } catch {}
     }
     if (!didFinish) {
-      ghComment(owner, repo, issueNumber,
+      await ghComment(installationId, owner, repo, issueNumber,
         `⚠️ 达到最大迭代次数（${MAX_ITERATIONS}轮），任务未完全完成。\n\n已执行 ${totalActions} 个操作（${failedActions} 个失败），耗时 ${elapsed}s。\n\n你可以再次 @devin 让我继续完成剩余工作。`
       );
     } else {
@@ -722,13 +878,13 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
         actionLog.length > 0 ? `### 操作记录\n${actionLog.map(l => `- ${l}`).join("\n")}` : "",
       ].filter(Boolean).join("\n");
 
-      ghComment(owner, repo, issueNumber, report);
+      await ghComment(installationId, owner, repo, issueNumber, report);
     }
 
     console.log(`[devin] Completed: ${key} (${elapsed}s total, finished=${didFinish})`);
   } catch (error) {
     console.error(`[devin] Error: ${key}:`, error);
-    ghComment(owner, repo, issueNumber,
+    await ghComment(installationId, owner, repo, issueNumber,
       `处理时遇到了错误：\n\n\`\`\`\n${error instanceof Error ? error.message : String(error)}\n\`\`\``
     );
   } finally {
@@ -765,6 +921,29 @@ app.post("/webhook", async (req, res) => {
   const event = JSON.parse(rawBody);
   res.json({ ok: true });
 
+  // Whitelist check
+  const repoOwner = event.repository?.owner?.login?.toLowerCase() ?? "";
+  if (ALLOWED_ACCOUNTS.length > 0 && repoOwner && !ALLOWED_ACCOUNTS.includes(repoOwner)) {
+    console.log(`[devin] ${repoOwner} not in whitelist, ignoring`);
+    return;
+  }
+
+  // Handle installation events (log only)
+  if (eventType === "installation") {
+    const action = event.action; // created, deleted, etc.
+    const account = event.installation?.account?.login ?? "unknown";
+    const installationId = event.installation?.id;
+    console.log(`[devin] Installation event: ${action} by ${account} (installation ${installationId})`);
+    return;
+  }
+
+  // Extract installation ID from webhook event
+  const installationId: number | undefined = event.installation?.id;
+  if (!installationId) {
+    console.log(`[devin] No installation ID in webhook event, ignoring`);
+    return;
+  }
+
   if (eventType === "issue_comment" && event.action === "created") {
     const body: string = event.comment?.body ?? "";
     if (!body.toLowerCase().includes("@devin")) return;
@@ -775,6 +954,7 @@ app.post("/webhook", async (req, res) => {
     if (body.startsWith("🤖") || body.startsWith("## 📋") || body.startsWith("## ✅") || body.includes("正在处理中") || body.includes("正在分析需求") || body.includes("posted by Devin, an AI agent")) return;
 
     enqueueTask({
+      installationId,
       owner: event.repository.owner.login,
       repo: event.repository.name,
       issueNumber: event.issue.number,
@@ -788,6 +968,7 @@ app.post("/webhook", async (req, res) => {
     if (!body.toLowerCase().includes("@devin")) return;
 
     enqueueTask({
+      installationId,
       owner: event.repository.owner.login,
       repo: event.repository.name,
       issueNumber: event.issue.number,
@@ -906,5 +1087,7 @@ app.get("/health", (_req, res) => {
 app.listen(PORT, () => {
   console.log(`[devin] Server running on port ${PORT}`);
   console.log(`[devin] Model: ${LLM_MODEL} @ ${LLM_BASE_URL}`);
+  console.log(`[devin] GitHub App ID: ${GITHUB_APP_ID}`);
+  console.log(`[devin] Allowed accounts: ${ALLOWED_ACCOUNTS.length > 0 ? ALLOWED_ACCOUNTS.join(", ") : "(all)"}`);
   console.log(`[devin] Workdir: ${WORKDIR}`);
 });
