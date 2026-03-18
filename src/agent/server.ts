@@ -23,6 +23,9 @@ const PORT = parseInt(process.env.PORT ?? "3001", 10);
 const WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET ?? "";
 const WORKDIR = process.env.DEVIN_WORKDIR ?? path.join(process.env.HOME ?? "/tmp", "devin-workspaces");
 const CONTEXT_DIR = path.join(WORKDIR, ".contexts");
+const FEEDBACK_DIR = path.join(WORKDIR, ".feedback");
+const GLOBAL_MEMORY_PATH = path.join(WORKDIR, ".global-memory.md");
+const EVOLUTION_RULES_FILE = path.join(WORKDIR, ".evolution-rules.md");
 
 const LLM_BASE_URL = process.env.LLM_BASE_URL ?? "https://api.deepseek.com";
 const LLM_API_KEY = process.env.LLM_API_KEY!;
@@ -137,6 +140,106 @@ function loadContext(owner: string, repo: string, issueNumber: number): Message[
 function saveContext(owner: string, repo: string, issueNumber: number, messages: Message[]) {
   fs.mkdirSync(CONTEXT_DIR, { recursive: true });
   fs.writeFileSync(contextPath(owner, repo, issueNumber), JSON.stringify(messages, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// Global memory (cross-project)
+// ---------------------------------------------------------------------------
+
+function loadGlobalMemory(): string {
+  try { return fs.readFileSync(GLOBAL_MEMORY_PATH, "utf-8"); }
+  catch { return ""; }
+}
+
+function loadRecentGlobalMemory(maxRecords: number = 10): string {
+  const content = loadGlobalMemory();
+  if (!content) return "";
+  // Each record starts with "---"
+  const records = content.split(/\n(?=---)/).filter(r => r.trim());
+  return records.slice(-maxRecords).join("\n");
+}
+
+function appendGlobalMemory(entry: string) {
+  fs.mkdirSync(path.dirname(GLOBAL_MEMORY_PATH), { recursive: true });
+  const existing = loadGlobalMemory();
+  const newContent = existing
+    ? `${existing}\n${entry}`
+    : `# Devin Global Memory\n\n${entry}`;
+  fs.writeFileSync(GLOBAL_MEMORY_PATH, newContent, "utf-8");
+}
+
+// ---------------------------------------------------------------------------
+// Evolution (adaptive rule learning)
+// ---------------------------------------------------------------------------
+
+function loadEvolutionRules(): string {
+  try { return fs.readFileSync(EVOLUTION_RULES_FILE, "utf-8"); }
+  catch { return ""; }
+}
+
+function getFeedbackCount(): number {
+  try {
+    if (!fs.existsSync(FEEDBACK_DIR)) return 0;
+    return fs.readdirSync(FEEDBACK_DIR).filter(f => f.endsWith(".json")).length;
+  } catch { return 0; }
+}
+
+function loadAllFeedback(): string {
+  try {
+    if (!fs.existsSync(FEEDBACK_DIR)) return "";
+    const files = fs.readdirSync(FEEDBACK_DIR).filter(f => f.endsWith(".json"));
+    const feedbacks: string[] = [];
+    for (const file of files) {
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(FEEDBACK_DIR, file), "utf-8"));
+        feedbacks.push(`[${data.rating}] ${data.owner}/${data.repo}#${data.issueNumber}: ${data.feedback}`);
+      } catch {}
+    }
+    return feedbacks.join("\n");
+  } catch { return ""; }
+}
+
+async function triggerEvolution(): Promise<string> {
+  console.log("[devin] Triggering evolution — analyzing feedback and memory...");
+
+  const allFeedback = loadAllFeedback();
+  const globalMemory = loadGlobalMemory();
+
+  if (!allFeedback && !globalMemory) {
+    console.log("[devin] No feedback or memory to evolve from.");
+    return "";
+  }
+
+  const evolutionPrompt: Message[] = [
+    {
+      role: "system",
+      content: `你是 Devin 的自我改进系统。根据以下历史反馈和任务记录，总结出 Devin 应该遵循的新规则。
+
+反馈记录：
+${allFeedback || "(无反馈)"}
+
+任务记录：
+${globalMemory || "(无记录)"}
+
+请输出 markdown 格式的规则列表，每条规则包含：
+- 规则描述
+- 为什么需要这条规则（基于什么反馈/失败）
+
+只输出规则，不要输出其他内容。最多 10 条规则。`,
+    },
+    {
+      role: "user",
+      content: "请分析以上数据并生成改进规则。",
+    },
+  ];
+
+  const rules = await chat(evolutionPrompt);
+
+  fs.mkdirSync(path.dirname(EVOLUTION_RULES_FILE), { recursive: true });
+  fs.writeFileSync(EVOLUTION_RULES_FILE, rules, "utf-8");
+
+  console.log("[devin] Evolution complete — rules updated.");
+  return rules;
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +589,45 @@ function enqueueTask(task: QueuedTask) {
     return;
   }
 
+  // Handle /feedback
+  if (task.request.trim().startsWith("/feedback")) {
+    const feedbackContent = task.request.trim().replace(/^\/feedback\s*/, "").trim();
+    if (feedbackContent) {
+      const positiveWords = ["good", "好", "不错", "满意", "👍"];
+      const negativeWords = ["bad", "差", "不好", "不满意", "👎"];
+      let rating: "positive" | "negative" | "neutral" = "neutral";
+      const lowerFeedback = feedbackContent.toLowerCase();
+      if (positiveWords.some(w => lowerFeedback.includes(w))) {
+        rating = "positive";
+      } else if (negativeWords.some(w => lowerFeedback.includes(w))) {
+        rating = "negative";
+      }
+      const timestamp = Date.now();
+      const feedbackData = {
+        owner: task.owner,
+        repo: task.repo,
+        issueNumber: task.issueNumber,
+        feedback: feedbackContent,
+        rating,
+        timestamp,
+      };
+      fs.mkdirSync(FEEDBACK_DIR, { recursive: true });
+      const feedbackFile = path.join(FEEDBACK_DIR, `${task.owner}_${task.repo}_${task.issueNumber}_${timestamp}.json`);
+      fs.writeFileSync(feedbackFile, JSON.stringify(feedbackData, null, 2));
+      ghComment(task.installationId, task.owner, task.repo, task.issueNumber, "感谢你的反馈！已记录。");
+
+      // Auto-trigger evolution when feedback count is a multiple of 5
+      const feedbackCount = getFeedbackCount();
+      if (feedbackCount > 0 && feedbackCount % 5 === 0) {
+        console.log(`[devin] Feedback count reached ${feedbackCount}, auto-triggering evolution...`);
+        triggerEvolution().catch(e => {
+          console.error("[devin] Auto-evolution failed:", e instanceof Error ? e.message : e);
+        });
+      }
+    }
+    return;
+  }
+
   const key = `${task.owner}/${task.repo}#${task.issueNumber}`;
 
   // Rate limiting
@@ -691,6 +833,7 @@ Issue #${issueNumber}：${issueTitle}
 ${fileTree || "(空项目)"}
 ${projectContext ? `\n项目说明：\n${projectContext}` : ""}
 ${projectMemory ? `\n项目记忆（来自 .devin/memory.md，包含跨 Issue 的经验和知识）：\n${projectMemory}` : ""}
+${(() => { const gm = loadRecentGlobalMemory(10); return gm ? `\n全局经验（来自所有项目的历史任务）：\n${gm}` : ""; })()}
 ${techContext ? `\n技术栈信息：\n${techContext}` : ""}
 ${directives.noMerge ? "\n⚠️ 用户指令：--no-merge，创建 PR 后不要自动合并，等人类 review。" : ""}
 ${directives.draft ? "\n⚠️ 用户指令：--draft，创建 Draft PR。" : ""}
@@ -752,7 +895,8 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
 - 如果某个 action 失败了，分析原因后重试或换一种方式
 - 修改已有文件时：必须先 read_file 读取当前内容，理解后再生成完整的新版本。不要凭记忆修改
 - 生成代码时注意：不要在 content 中包含 markdown 代码块标记（系统会自动清理，但最好从源头避免）
-- 写代码时遵循项目已有的代码风格（从技术栈信息和文件内容推断）`,
+- 写代码时遵循项目已有的代码风格（从技术栈信息和文件内容推断）
+${(() => { const rules = loadEvolutionRules(); return rules ? `\n## 从历史反馈中学习到的规则\n${rules}` : ""; })()}`,
       }, {
         role: "user",
         content: `Issue 标题：${issueTitle}\nIssue 内容：${issueBody}\n\n用户请求：${request}`,
@@ -876,12 +1020,32 @@ ${directives.noClose ? "\n⚠️ 用户指令：--no-close，不要关闭 Issue�
         `| 迭代轮数 | ${messages.filter(m => m.role === "assistant").length} |`,
         ``,
         actionLog.length > 0 ? `### 操作记录\n${actionLog.map(l => `- ${l}`).join("\n")}` : "",
+        ``,
+        `> 对这次任务满意吗？请用 👍 或 👎 回应这条评论，或者回复 \`@devin /feedback 你的反馈\``,
       ].filter(Boolean).join("\n");
 
       await ghComment(installationId, owner, repo, issueNumber, report);
     }
 
     console.log(`[devin] Completed: ${key} (${elapsed}s total, finished=${didFinish})`);
+
+    // Append global memory record
+    try {
+      const timestamp = new Date().toISOString().split("T")[0];
+      const status = didFinish ? "done" : "unfinished";
+      const result = didFinish ? "成功" : "未完成";
+      const memoryEntry = [
+        `---`,
+        `_${timestamp} | ${owner}/${repo}#${issueNumber} | 状态: ${status} | 耗时: ${elapsed}s | 操作: ${totalActions}个(${failedActions}失败)_`,
+        ``,
+        `**任务**: ${issueTitle}`,
+        `**结果**: ${result}`,
+      ].join("\n");
+      appendGlobalMemory(memoryEntry);
+      console.log(`[devin] Global memory updated for ${key}`);
+    } catch (memErr) {
+      console.error(`[devin] Failed to update global memory:`, memErr instanceof Error ? memErr.message : memErr);
+    }
   } catch (error) {
     console.error(`[devin] Error: ${key}:`, error);
     await ghComment(installationId, owner, repo, issueNumber,
@@ -902,7 +1066,7 @@ app.use(express.text({ type: "application/json", limit: "10mb" }));
 // CORS for Dashboard
 app.use((_req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type");
   if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
@@ -1073,6 +1237,44 @@ app.get("/api/tasks/:owner/:repo/:issueNumber", (req, res) => {
   }
 });
 
+app.get("/api/memory", (_req, res) => {
+  try {
+    const content = loadGlobalMemory();
+    res.json({ content });
+  } catch (e) {
+    console.error("[devin] /api/memory error:", e);
+    res.status(500).json({ error: "Failed to load global memory" });
+  }
+});
+
+app.get("/api/feedback", (_req, res) => {
+  try {
+    if (!fs.existsSync(FEEDBACK_DIR)) {
+      res.json({ total: 0, positive: 0, negative: 0, neutral: 0, recent: [] });
+      return;
+    }
+    const files = fs.readdirSync(FEEDBACK_DIR).filter(f => f.endsWith(".json"));
+    const feedbacks: any[] = [];
+    for (const file of files) {
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(FEEDBACK_DIR, file), "utf-8"));
+        feedbacks.push(data);
+      } catch { continue; }
+    }
+    // Sort by timestamp descending
+    feedbacks.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+    const total = feedbacks.length;
+    const positive = feedbacks.filter(f => f.rating === "positive").length;
+    const negative = feedbacks.filter(f => f.rating === "negative").length;
+    const neutral = feedbacks.filter(f => f.rating === "neutral").length;
+    const recent = feedbacks.slice(0, 10);
+    res.json({ total, positive, negative, neutral, recent });
+  } catch (e) {
+    console.error("[devin] /api/feedback error:", e);
+    res.status(500).json({ error: "Failed to load feedback" });
+  }
+});
+
 app.get("/health", (_req, res) => {
   const contexts = fs.existsSync(CONTEXT_DIR) ? fs.readdirSync(CONTEXT_DIR).length : 0;
   res.json({
@@ -1082,6 +1284,37 @@ app.get("/health", (_req, res) => {
     queuedTasks: taskQueue.length,
     model: LLM_MODEL,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Evolution API endpoints
+// ---------------------------------------------------------------------------
+
+app.get("/api/evolve", (_req, res) => {
+  try {
+    const rules = loadEvolutionRules();
+    let lastUpdated: string | null = null;
+    try {
+      if (fs.existsSync(EVOLUTION_RULES_FILE)) {
+        const stat = fs.statSync(EVOLUTION_RULES_FILE);
+        lastUpdated = stat.mtime.toISOString();
+      }
+    } catch {}
+    res.json({ rules, lastUpdated });
+  } catch (e) {
+    console.error("[devin] GET /api/evolve error:", e);
+    res.status(500).json({ error: "Failed to load evolution rules" });
+  }
+});
+
+app.post("/api/evolve", async (_req, res) => {
+  try {
+    const rules = await triggerEvolution();
+    res.json({ success: true, rules });
+  } catch (e) {
+    console.error("[devin] POST /api/evolve error:", e);
+    res.status(500).json({ error: "Evolution failed", detail: e instanceof Error ? e.message : String(e) });
+  }
 });
 
 app.listen(PORT, () => {
