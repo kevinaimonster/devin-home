@@ -155,14 +155,47 @@ Agent 失败回退：Agent 报错/超时/无法完成 → 保留成功 Agent 的
 - 修改已有文件优先于新建文件
 - 每个文件改完后确认无语法问题
 
-### 3.3 验证
+### 3.3 验证（智能重试）
 
-执行 DEVIN.md 或 CLAUDE.md 中记录的验证命令：
-- Java 项目：`mvn clean package -pl {module}` 或项目特定命令
-- Node 项目：`yarn typecheck` / `yarn test` / `npm run build`
-- 通用：`git diff --stat` 确认改动范围
+执行 DEVIN.md 或 CLAUDE.md 中记录的验证命令。Build 和 Test **分离处理**，各自独立计数。
 
-如果验证失败 → 读错误信息 → 修复 → 重新验证（最多 3 轮）。
+**运行时异常直接停止**（不进入重试）：
+- OOM（exit code 137 / `out of memory`）、Segfault（exit code 139）、Timeout（5 分钟无输出）、磁盘满
+
+**3.3.1 Build 阶段**：
+
+运行 build 命令。如果失败：
+1. 保留错误输出最后 100 行作为"错误快照"
+2. 与上轮快照比较，判断是否在进步：
+   - **SAME**（本质相同的错误）→ 停止重试，报告用户
+   - **DIFFERENT + MORE**（越修越多）→ 连续 2 轮退步则停止
+   - **DIFFERENT + FEWER/EQUAL**（有进步）→ 继续
+3. 读错误 → 修复 → 重跑 build
+4. 最多 5 轮。
+
+**3.3.2 Test 阶段**（build 通过后）：
+
+运行 test 命令。如果失败：
+1. 保留错误快照，同上方式判断进步
+2. 修复后**先重跑 build**确认不 break，再跑 test
+3. 最多 5 轮（独立于 build 计数）
+
+**3.3.3 Flaky Test**：
+
+如果 test 失败 case 与上轮完全相同且两轮间没有代码修改 → 疑似 flaky：
+- 不改代码直接 re-run 一次
+- 通过 → 标记 flaky，继续
+- 仍失败 → 跳过这些 case，在最终汇报中列出
+
+**3.3.4 安全阀**：
+- 单轮修复涉及 > 10 文件 → 停止（改动范围失控）
+- 累计修复涉及 > 20 文件 → 停止
+
+**3.3.5 中间进度**：
+
+每轮重试输出一行：`[Build/Test 第 N/5 轮] 修复了 X 个错误，还剩 Y 个`
+
+**Warning 处理**：0 error + 有 warning → 通过但在汇报中列出。deprecated/unsafe/security 关键词显式高亮。
 
 ### 3.4 独立验证（Verification Agent）
 
