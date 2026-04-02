@@ -8,6 +8,8 @@ description: |
 
 # Devin — 全栈开发工作流
 
+**恢复检查**（每次触发 /devin 时最先执行）：读取目标项目的 `.devin-state.json`，如果存在且 `phase != "done"` → 输出"发现未完成任务: {task}，当前阶段: {phase}" → 询问用户是否继续。如果 `phase == "done"` → 输出"上次任务已完成（PR: {prUrl}）" → 删除状态文件。
+
 收到需求后完成：需求理解 → 方案确认 → 代码修改 → 验证 → PR 交付。
 
 ## Phase 1：需求理解
@@ -110,6 +112,26 @@ description: |
 - 追问（"yyy 会不会有影响"）→ 补充分析
 
 ## Phase 3：执行交付
+
+### 3.0 状态初始化 + 进度追踪
+
+**状态文件**：在 `{project_path}/.devin-state.json` 持久化任务状态，用于 session 中断后恢复。
+
+初始化时写入：`version: 1, task, branch, baseBranch, projectPath, projectName, plan（全部 pending）, phase: "executing"`
+
+写入时机（仅 4 个关键节点）：
+1. 分支创建完成 → `phase: "executing"`
+2. 所有文件改完 → `phase: "verifying"`，plan.completed 更新
+3. 验证通过 → `phase: "submitting"`，verifyStatus 更新
+4. PR 创建完成 → `phase: "done"`，prUrl 更新
+
+完成后不删除，设 `phase: "done"`，下次 `/devin` 触发时清理。
+写入失败不阻塞主流程。首次写入前确保 `.gitignore` 包含 `.devin-state.json`。
+
+**进度输出**（零工具调用，纯文本）：
+
+每个步骤开始时输出：`[devin] ---- 步骤 {n}/{total}: {步骤名} ----`
+每个步骤完成时输出：`[devin] ✓ {步骤名} 完成` 或 `[devin] ✗ {步骤名} 失败: {原因}`
 
 ### 3.1 分支准备
 
