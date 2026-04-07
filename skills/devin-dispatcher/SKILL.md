@@ -10,6 +10,8 @@ description: |
 
 **恢复检查**（每次触发 /devin 时最先执行）：读取目标项目的 `.devin-state.json`，如果存在且 `phase != "done"` → 输出"发现未完成任务: {task}，当前阶段: {phase}" → 询问用户是否继续。如果 `phase == "done"` → 输出"上次任务已完成（PR: {prUrl}）" → 删除状态文件。
 
+**知识整合检查**（恢复检查之后、需求理解之前）：检查 DEVIN.md 是否需要 Tier 3 整合（见"SecondBrain"节）。
+
 收到需求后完成：需求理解 → 方案确认 → 代码修改 → 验证 → PR 交付。
 
 ## Phase 1：需求理解
@@ -117,7 +119,7 @@ description: |
 
 **状态文件**：在 `{project_path}/.devin-state.json` 持久化任务状态，用于 session 中断后恢复。
 
-初始化时写入：`version: 1, task, branch, baseBranch, projectPath, projectName, plan（全部 pending）, phase: "executing"`
+初始化时写入：`version: 2, task, branch, baseBranch, projectPath, projectName, plan（全部 pending）, learnings: [], phase: "executing"`
 
 写入时机（仅 4 个关键节点）：
 1. 分支创建完成 → `phase: "executing"`
@@ -177,6 +179,14 @@ Agent 失败回退：Agent 报错/超时/无法完成 → 保留成功 Agent 的
 - 修改已有文件优先于新建文件
 - 每个文件改完后确认无语法问题
 
+**学习笔记**（SecondBrain Tier 1）：每个文件/模块改完后，如果发现了新的架构关系、意外依赖、接口约束，记录到 `.devin-state.json` 的 `learnings` 数组：
+```json
+{"phase": "3.2", "type": "discovery|gotcha|pattern|decision", "content": "≤200字描述"}
+```
+不记录：可从代码直接读到的架构信息、文件内具体代码内容、git 可查的变更历史、临时调试步骤。只记录**非显而易见的、跨文件/跨模块的隐含关系**。每个任务最多 10 条。
+
+如果上下文紧张无法记录 → 降级：在 Phase 3.6 汇报时补充一段"本次发现"文字描述（不写 JSON）。
+
 ### 3.3 验证（智能重试）
 
 执行 DEVIN.md 或 CLAUDE.md 中记录的验证命令。Build 和 Test **分离处理**，各自独立计数。
@@ -218,6 +228,8 @@ Agent 失败回退：Agent 报错/超时/无法完成 → 保留成功 Agent 的
 每轮重试输出一行：`[Build/Test 第 N/5 轮] 修复了 X 个错误，还剩 Y 个`
 
 **Warning 处理**：0 error + 有 warning → 通过但在汇报中列出。deprecated/unsafe/security 关键词显式高亮。
+
+**学习笔记**（SecondBrain Tier 1）：每次 build/test 失败并修复后，将踩坑经验记录到 learnings（type: gotcha）。
 
 ### 3.4 独立验证（Verification Agent）
 
@@ -362,8 +374,14 @@ gh pr create --base {baseBranch} --title "{PR title}" --body "{PR body with summ
 - 独立验证: {PASS / PARTIAL（原因）/ 已跳过（原因）}
 - 验证约束: prompt 级只读（行为审计: 通过 / 已检测违规并还原）
 - 风险级别: {LOW / MEDIUM / HIGH}
+- 学习笔记: 本次新增 {N} 条，{M} 条已提取到 DEVIN.md
 - 后续: {需要用户做的事}
 ```
+
+**SecondBrain Tier 2（自动提取）**：汇报完成后，读取 `.devin-state.json` 中的 learnings，逐条评估是否有跨任务价值：
+- **有持久价值**（构建前置条件、模块间隐含依赖、项目约定、环境配置）→ 按 DEVIN.md 写入规则提取到对应分区
+- **仅当前任务有用**（具体 bug 修复代码、某次 build 的错误信息、临时调试步骤）→ 不提取
+- 提取时遵循 SPEC-06 所有规则（主键去重、分区归类、CLAUDE.md 边界）
 
 ## 项目注册表
 
@@ -454,3 +472,43 @@ gh pr create --base {baseBranch} --title "{PR title}" --body "{PR body with summ
 1. 读取现有内容 → 按语义分类到 5 个分区
 2. 无法归类的放"踩坑记录"末尾标注"(待归类)"
 3. 写入后检查 5 个 `##` 分区标题完整性
+
+## SecondBrain — 三层知识级联
+
+借鉴 Claude Code 的 SessionMemory + ExtractMemories + AutoDream 三层记忆体系。
+
+### Tier 1: 任务内学习笔记
+
+在 Phase 3 的三个检查点记录 learnings 到 `.devin-state.json`：
+- **3.2 修改后**：新发现的架构关系、意外依赖（type: discovery/pattern）
+- **3.3 重试后**：build/test 失败的踩坑经验（type: gotcha）
+- **3.4 验证后**：验证 Agent FAIL 后修复的经验（type: gotcha）
+
+Learning 类型：`discovery`（架构发现）| `gotcha`（踩坑）| `pattern`（代码模式）| `decision`（设计决策）
+
+约束：每任务 ≤ 10 条，每条 ≤ 200 字。不记录可从代码读到的、具体修改内容、临时调试步骤。
+
+### Tier 2: 任务后自动提取
+
+Phase 3.6 汇报完成后自动执行。将有**跨任务价值**的 learnings 提取到 DEVIN.md：
+- discovery → 模块地图 或 领域映射
+- gotcha → 踩坑记录 或 环境前置条件
+- pattern → 踩坑记录
+- decision → 通常不提取（除非是架构级决策）
+
+### Tier 3: 跨任务知识整合
+
+每次 `/devin` 触发时，在恢复检查之后检查整合条件：
+
+```
+门控 1：DEVIN.md 存在且非空
+门控 2：自上次整合以来 ≥ 3 次 devin 任务
+门控 3：DEVIN.md 总条目数 ≥ 20
+```
+
+全部通过 → 派 Agent 执行整合：合并重复条目、清理过时条目（文件不存在）、提升结构。
+
+整合 Agent 约束：只编辑 DEVIN.md，不改其他文件。整合后条目应减少 20-40%。
+**行为审计**（与 SPEC-01 验证 Agent 相同）：整合 Agent 返回后，检查 `git diff --name-only`，如果修改了 DEVIN.md 以外的文件则 `git checkout -- {非 DEVIN.md 文件}` 还原。
+
+任务计数追踪：在 DEVIN.md 头部用注释 `<!-- devin-meta: {"lastConsolidation": "日期", "tasksSinceConsolidation": N} -->` 记录。
